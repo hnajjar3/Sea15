@@ -12,7 +12,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
-
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderClass
 # ==============================================================================
 # 🌊 PROJECT SEA 15: THE TURBO CAPTAIN (MULTI-THREADED)
 # ==============================================================================
@@ -100,24 +101,37 @@ def get_realtime_quotes_turbo(tickers):
     return pd.DataFrame(all_quotes)
 
 def execute_order_async(ticker, action, shares, price, gap):
-    """Worker function to execute a single order."""
-    print(f"   🚀 FIRE: {action} {shares} {ticker}...")
+    """Worker function to execute a single order WITH ATTACHED STOP LOSS."""
+    print(f"   🚀 FIRE: {action} {shares} {ticker} @ ~${price}...")
     
     side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
+    
+    # 1. Calculate the Hard Stop Price based on the LIVE quote
+    # We use the 'price' passed from the scanner (which is the live quote)
+    if action == "BUY":
+        stop_price = round(price * (1 - STOP_BUFFER), 2)
+    else: # SHORT
+        stop_price = round(price * (1 + STOP_BUFFER), 2)
+
     try:
-        # Check tradability inside the thread (fast check)
-        # Note: In ultra-fast mode, we might skip is_tradable() check to save time,
-        # relying on Alpaca to reject it if invalid. Here we send it directly.
-        
+        # 2. Construct the Bracket Order
+        # This sends: Market Entry + Stop Loss Exit simultaneously
         order_data = MarketOrderRequest(
-            symbol=ticker, qty=shares, side=side, time_in_force=TimeInForce.DAY
+            symbol=ticker,
+            qty=shares,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,  # <--- Tells Alpaca this is a complex order
+            stop_loss=StopLossRequest(stop_price=stop_price) # <--- The Protection
         )
+        
         alpaca.submit_order(order_data)
         
         # Log success
         log_entry(ticker, action, price, gap, shares)
-        print(f"   ✅ SENT: {ticker}")
+        print(f"   ✅ SENT: {ticker} (SL: ${stop_price})")
         return True
+        
     except Exception as e:
         print(f"   ❌ ERROR {ticker}: {e}")
         return False
