@@ -9,21 +9,34 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # ==========================================
 # CONFIGURATION
 # ==========================================
+# TOGGLES
+ENABLE_MC = True             # Set to True for Monte Carlo, False for Single Run
+ENABLE_FRICTION = True       # Set to True to include Slippage & Commissions
+
+# API & DATA
 API_KEY = 'iuRa8nmjQdLOx66QtJiSWFitzOMqu6QF' 
 BASE_URL = "https://financialmodelingprep.com/api/v3"
 CACHE_DIR = 'market_data_cache'
+MASTER_POOL_FILE = 'sea_master_pool.csv'  # Intermediate cache for speed
 
-# Strategy Params
+# STRATEGY PARAMS
 GAP_UP_MIN, GAP_UP_MAX = 0.05, 0.13
 GAP_DOWN_THRESHOLD = -0.05
 MIN_PRICE, MAX_PRICE = 1.00, 50.00
 MIN_VOLUME = 10000 
+LOOKBACK_DAYS = 1095
 STOP_LOSS_PCT = 0.05        # 5% Hard Stop Loss
 
-# Backtest Params
-LOOKBACK_DAYS = 1095
-MAX_TRADES_PER_DAY = 10  # 5 Short + 5 Long
-FORCE_UPDATE = False
+# SIMULATION PARAMS
+MAX_TRADES_PER_DAY = 10     # 5 Short + 5 Long
+NUM_SIMULATIONS = 50        # Only used if ENABLE_MC = True
+FORCE_UPDATE = False        # Set True to re-download market data
+FORCE_REGEN_POOL = False    # Set True to re-calculate signals (Master Pool)
+
+# FRICTION PARAMS (Used if ENABLE_FRICTION = True)
+SLIPPAGE_PCT = 0.001        # 0.1% Slippage per side (Entry AND Exit)
+COMMISSION_PER_TRADE = 1.00 # $1.00 per trade
+AVG_TRADE_SIZE = 2000       # Size of 1 Unit (R) in Dollars
 
 # Ensure cache directory exists
 if not os.path.exists(CACHE_DIR):
@@ -33,7 +46,7 @@ class APIError(Exception):
     pass
 
 # ==========================================
-# ROBUST API HANDLER
+# 1. DATA HARVESTING
 # ==========================================
 @retry(
     stop=stop_after_attempt(5), 
@@ -53,9 +66,6 @@ def fetch_url(url):
         print(f"⚠️ Network Error: {e}")
         raise APIError(str(e))
 
-# ==========================================
-# DATA FETCHING
-# ==========================================
 def get_nasdaq_tickers():
     cache_path = os.path.join(CACHE_DIR, 'nasdaq_tickers_list.pkl')
     if not FORCE_UPDATE and os.path.exists(cache_path):
@@ -100,11 +110,26 @@ def get_historical_data(ticker):
         return pd.DataFrame()
 
 # ==========================================
-# BACKTEST LOGIC (WITH STOP LOSS)
+# 2. MASTER POOL GENERATION
 # ==========================================
-def run_backtest_robust(tickers):
-    print(f"⚡ Starting Robust Backtest (No Look-Ahead + Daily Limits + {STOP_LOSS_PCT*100}% SL)...")
-    
+def generate_master_pool(tickers):
+    # Check if we can load from cache
+    if not FORCE_REGEN_POOL and os.path.exists(MASTER_POOL_FILE):
+        print(f"📂 Loading Master Signal Pool from {MASTER_POOL_FILE}...")
+        try:
+            pool = pd.read_csv(MASTER_POOL_FILE)
+            # Re-apply friction logic if needed, or assume cache is raw?
+            # Better to cache RAW signals (PnL without friction) and apply friction dynamically.
+            # However, for simplicity and speed, let's regenerate if parameters change significantly.
+            # But since we have Toggles, let's cache the RAW outcome and apply friction in memory.
+            # Wait, the user wants "Unify them".
+            # Strategy: The Master Pool stores 'Raw PnL'. 
+            # We calculate Net PnL during the simulation/processing phase based on the toggle.
+            return pool
+        except Exception as e:
+            print(f"⚠️ Error loading cache: {e}. Regenerating...")
+
+    print(f"⚡ Generating New Master Signal Pool (SL: {STOP_LOSS_PCT*100}%)...")
     all_signals = []
     
     for i, ticker in enumerate(tickers):
@@ -113,17 +138,17 @@ def run_backtest_robust(tickers):
         df = get_historical_data(ticker)
         if df.empty or len(df) < 5: continue
             
-        # 1. Shift Volume for 'Yesterday's Volume'
+        # Shift Volume
         df['vol_prev'] = df['volume'].shift(1)
         
-        # 2. Filter Validity
+        # Filter Validity
         df = df[(df['open'] > 0.01) & (df['close'] > 0.01) & (df['vol_prev'] > MIN_VOLUME)].copy()
         
         # Calculate Gaps
         df['prev_close'] = df['close'].shift(1)
         df['gap_pct'] = (df['open'] - df['prev_close']) / df['prev_close']
         
-        # 3. Identify Shorts
+        # --- SHORTS ---
         short_mask = (
             (df['gap_pct'] >= GAP_UP_MIN) & 
             (df['gap_pct'] <= GAP_UP_MAX) & 
@@ -133,27 +158,24 @@ def run_backtest_robust(tickers):
         if short_mask.any():
             shorts = df[short_mask].copy()
             for date, row in shorts.iterrows():
-                # SHORT LOGIC WITH STOP LOSS
                 entry_price = row['open']
                 stop_price = entry_price * (1 + STOP_LOSS_PCT)
                 
-                # Check if High breached Stop Price
+                # Check Stop Loss
                 if row['high'] >= stop_price:
-                    # Stopped out
-                    pnl = -STOP_LOSS_PCT
+                    raw_pnl = -STOP_LOSS_PCT
                     outcome = 'Stopped Out'
                 else:
-                    # Normal Close
-                    pnl = (entry_price - row['close']) / entry_price
-                    outcome = 'Win' if pnl > 0 else 'Loss'
+                    raw_pnl = (entry_price - row['close']) / entry_price
+                    outcome = 'Win' if raw_pnl > 0 else 'Loss'
 
                 all_signals.append({
                     'Date': date, 'Ticker': ticker, 'Type': 'Short',
-                    'Price': entry_price, 'Gap': row['gap_pct'], 
-                    'PnL': pnl, 'Outcome': outcome
+                    'Raw_PnL': raw_pnl, 'Outcome': outcome,
+                    'Entry_Price': entry_price
                 })
 
-        # 4. Identify Longs
+        # --- LONGS ---
         long_mask = (
             (df['gap_pct'] <= GAP_DOWN_THRESHOLD) & 
             (df['open'] >= MIN_PRICE) & 
@@ -162,115 +184,243 @@ def run_backtest_robust(tickers):
         if long_mask.any():
             longs = df[long_mask].copy()
             for date, row in longs.iterrows():
-                # LONG LOGIC WITH STOP LOSS
                 entry_price = row['open']
                 stop_price = entry_price * (1 - STOP_LOSS_PCT)
                 
-                # Check if Low breached Stop Price
+                # Check Stop Loss
                 if row['low'] <= stop_price:
-                    # Stopped out
-                    pnl = -STOP_LOSS_PCT
+                    raw_pnl = -STOP_LOSS_PCT
                     outcome = 'Stopped Out'
                 else:
-                    # Normal Close
-                    pnl = (row['close'] - entry_price) / entry_price
-                    outcome = 'Win' if pnl > 0 else 'Loss'
+                    raw_pnl = (row['close'] - entry_price) / entry_price
+                    outcome = 'Win' if raw_pnl > 0 else 'Loss'
 
                 all_signals.append({
                     'Date': date, 'Ticker': ticker, 'Type': 'Long',
-                    'Price': entry_price, 'Gap': row['gap_pct'], 
-                    'PnL': pnl, 'Outcome': outcome
+                    'Raw_PnL': raw_pnl, 'Outcome': outcome,
+                    'Entry_Price': entry_price
                 })
 
-    # --- THE REALITY CHECK (Daily Limits) ---
-    print("🎲 Applying Daily Limit Logic (Random Selection)...")
-    full_df = pd.DataFrame(all_signals)
-    full_df['Date'] = pd.to_datetime(full_df['Date'])
-    
-    final_trades = []
-    
-    # Group by Date to simulate a single trading day
-    for date, group in full_df.groupby('Date'):
-        shorts = group[group['Type'] == 'Short']
-        longs = group[group['Type'] == 'Long']
-        
-        # Randomly pick up to N Shorts
-        if len(shorts) > (MAX_TRADES_PER_DAY // 2):
-            shorts = shorts.sample(n=(MAX_TRADES_PER_DAY // 2), random_state=42)
-        
-        # Randomly pick up to N Longs
-        if len(longs) > (MAX_TRADES_PER_DAY // 2):
-            longs = longs.sample(n=(MAX_TRADES_PER_DAY // 2), random_state=42)
-            
-        final_trades.extend(shorts.to_dict('records'))
-        final_trades.extend(longs.to_dict('records'))
-        
-    return pd.DataFrame(final_trades)
+    pool_df = pd.DataFrame(all_signals)
+    pool_df.to_csv(MASTER_POOL_FILE, index=False)
+    return pool_df
 
 # ==========================================
-# REPORTING & VISUALIZATION
+# 3. SIMULATION ENGINE
 # ==========================================
-def generate_report(results):
-    if results.empty:
-        print("No trades found.")
+def apply_friction(row):
+    """Calculates Net PnL based on Friction settings."""
+    if not ENABLE_FRICTION:
+        return row['Raw_PnL']
+    
+    # Friction Calculation
+    # Commission Impact in % terms relative to Trade Size
+    comm_pct = COMMISSION_PER_TRADE / AVG_TRADE_SIZE
+    
+    # Slippage: Paid on Entry AND Exit
+    # If Stopped Out: Entry Slip + Stop Slip
+    # If Closed: Entry Slip + Close Slip
+    # In both cases, we pay 2x Slippage
+    total_slip = SLIPPAGE_PCT * 2
+    
+    return row['Raw_PnL'] - total_slip - comm_pct
+
+def run_simulation(master_pool):
+    print(f"\n🚀 Starting Simulation Engine...")
+    print(f"   Mode: {'Monte Carlo' if ENABLE_MC else 'Single Run'}")
+    print(f"   Friction: {'ON' if ENABLE_FRICTION else 'OFF'}")
+    
+    # Apply Friction/Net PnL Calculation
+    master_pool['Net_PnL'] = master_pool.apply(apply_friction, axis=1)
+    
+    master_pool['Date'] = pd.to_datetime(master_pool['Date'])
+    limit_per_side = MAX_TRADES_PER_DAY // 2
+    
+    simulations = []
+    num_runs = NUM_SIMULATIONS if ENABLE_MC else 1
+    
+    for i in range(num_runs):
+        if num_runs > 1 and (i+1) % 10 == 0:
+            print(f"   Simulating Universe {i+1}/{num_runs}...")
+            
+        seed = 42 + i # Deterministic seeds
+        sim_trades = []
+        
+        # Daily Logic
+        for date, group in master_pool.groupby('Date'):
+            shorts = group[group['Type'] == 'Short']
+            longs = group[group['Type'] == 'Long']
+            
+            # Random Selection
+            if len(shorts) > limit_per_side:
+                shorts = shorts.sample(n=limit_per_side, random_state=seed)
+            
+            if len(longs) > limit_per_side:
+                longs = longs.sample(n=limit_per_side, random_state=seed)
+                
+            sim_trades.extend(shorts.to_dict('records'))
+            sim_trades.extend(longs.to_dict('records'))
+            
+        # Create DataFrame for this simulation
+        sim_df = pd.DataFrame(sim_trades)
+        if sim_df.empty:
+            continue
+            
+        sim_df = sim_df.sort_values('Date')
+        sim_df['Equity'] = sim_df['Net_PnL'].cumsum()
+        sim_df['Sim_ID'] = i + 1
+        simulations.append(sim_df)
+        
+    return simulations
+
+# ==========================================
+# 4. REPORTING & VISUALIZATION
+# ==========================================
+def calculate_kpis(df):
+    """Calculates KPIs for a single dataframe of trades."""
+    if df.empty: return {}
+    
+    # Win Rate
+    wins = df[df['Net_PnL'] > 0]
+    win_rate = (len(wins) / len(df)) * 100
+    
+    # Stop Out Rate
+    stopped = df[df['Outcome'] == 'Stopped Out']
+    stop_rate = (len(stopped) / len(df)) * 100
+    
+    # Returns
+    avg_ret = df['Net_PnL'].mean() * 100
+    total_r = df['Net_PnL'].sum()
+    
+    # Drawdown
+    df = df.sort_values('Date').copy() # Ensure sorted
+    df['Equity'] = df['Net_PnL'].cumsum()
+    df['HWM'] = df['Equity'].cummax()
+    df['DD'] = df['Equity'] - df['HWM']
+    max_dd = df['DD'].min()
+    
+    return {
+        'Trades': len(df),
+        'Win Rate %': win_rate,
+        'Stop Rate %': stop_rate,
+        'Avg Return %': avg_ret,
+        'Total R': total_r,
+        'Max DD R': max_dd
+    }
+
+def generate_report(simulations):
+    if not simulations:
+        print("❌ No trades generated.")
         return
 
-    print("\n" + "="*60)
-    print(f"📊 3-YEAR OPTIMIZED STRATEGY REPORT (SL: {STOP_LOSS_PCT*100}%)")
-    print("="*60)
-
-    results['Date'] = pd.to_datetime(results['Date'])
+    timestamp = datetime.now().strftime('%Y%m%d%H%M')
     
-    plt.figure(figsize=(12, 6))
-
-    for t_type in ['Short', 'Long']:
-        subset = results[results['Type'] == t_type].copy()
-        if subset.empty: continue
+    # --- MONTE CARLO MODE ---
+    if ENABLE_MC:
+        print(f"\n📊 MONTE CARLO REPORT ({NUM_SIMULATIONS} Runs)")
         
-        subset = subset.sort_values('Date')
+        all_kpis = []
+        equity_curves = []
         
-        # --- METRICS ---
-        win_rate = (len(subset[subset['PnL'] > 0]) / len(subset)) * 100
-        stop_out_rate = (len(subset[subset['Outcome'] == 'Stopped Out']) / len(subset)) * 100
-        avg_ret = subset['PnL'].mean() * 100
-        total_pnl = subset['PnL'].sum()
+        # Calculate KPIs for each universe
+        for sim in simulations:
+            kpis = calculate_kpis(sim)
+            all_kpis.append(kpis)
+            
+            # Prepare equity curve for plotting
+            curve = sim[['Date', 'Equity']].set_index('Date')
+            curve.columns = [f"Run_{sim['Sim_ID'].iloc[0]}"]
+            equity_curves.append(curve)
+            
+        kpi_df = pd.DataFrame(all_kpis)
         
-        # Equity Curve
-        subset['Equity'] = subset['PnL'].cumsum()
-        
-        # Drawdown
-        subset['HWM'] = subset['Equity'].cummax()
-        subset['DD'] = subset['Equity'] - subset['HWM']
-        max_dd = subset['DD'].min()
-
-        print("\n" + "="*60)
-        print(f"🌊 SEA 15 OPTIMIZED: {t_type.upper()}")
+        # Aggregate Stats
         print("="*60)
-        print(f"   Trades:         {len(subset)}")
-        print(f"   Win Rate:       {win_rate:.2f}%")
-        print(f"   Stop Out Rate:  {stop_out_rate:.2f}%")
-        print(f"   Avg Return:     {avg_ret:.2f}%")
-        print(f"   Total Units:    {total_pnl:.2f} R")
-        print(f"   Max Drawdown:   {max_dd:.2f} R")
+        print(f"{'Metric':<20} | {'Mean':<10} | {'Min (Worst)':<10} | {'Max (Best)':<10}")
+        print("-" * 60)
+        for col in kpi_df.columns:
+            mean_val = kpi_df[col].mean()
+            min_val = kpi_df[col].min()
+            max_val = kpi_df[col].max()
+            print(f"{col:<20} | {mean_val:10.2f} | {min_val:10.2f} | {max_val:10.2f}")
+        print("="*60)
         
-        plt.plot(subset['Date'], subset['Equity'], label=f"{t_type} ({total_pnl:.1f}R)")
+        # Save Summary
+        summary_file = f"summary_mc_{timestamp}.csv"
+        kpi_df.to_csv(summary_file, index=False)
+        print(f"✅ Summary Stats saved to {summary_file}")
+        
+        # Plot Multiverse
+        full_curves = pd.concat(equity_curves, axis=1).ffill().fillna(0)
+        plt.figure(figsize=(12, 8))
+        
+        # Ghost Lines
+        for col in full_curves.columns:
+            plt.plot(full_curves.index, full_curves[col], alpha=0.1, color='gray', linewidth=1)
+            
+        # Average Line
+        avg_curve = full_curves.mean(axis=1)
+        plt.plot(avg_curve.index, avg_curve, color='#007BFF', linewidth=2.5, label='Average Outcome')
+        
+        # Best/Worst
+        final_vals = full_curves.iloc[-1]
+        best_col = final_vals.idxmax()
+        worst_col = final_vals.idxmin()
+        plt.plot(full_curves.index, full_curves[best_col], 'g--', alpha=0.8, label='Best Run')
+        plt.plot(full_curves.index, full_curves[worst_col], 'r--', alpha=0.8, label='Worst Run')
+        
+        plt.title(f"Monte Carlo ({NUM_SIMULATIONS} Runs) - SL: {STOP_LOSS_PCT*100}% - Friction: {ENABLE_FRICTION}")
+        plt.ylabel("Accumulated R")
+        plt.legend()
+        plt.grid(True, alpha=0.2)
+        
+        plot_file = f"chart_mc_{timestamp}.png"
+        plt.savefig(plot_file)
+        print(f"✅ Chart saved to {plot_file}")
 
-    plt.title(f'Equity Curve (SL {STOP_LOSS_PCT*100}%): Gap {int(GAP_UP_MIN*100)}-{int(GAP_UP_MAX*100)}%')
-    plt.xlabel('Date')
-    plt.ylabel('Accumulated Risk Units (R)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig('nasdaq_sl_curve.png')
-    print("\n✅ Chart saved to 'nasdaq_sl_curve.png'")
-    
-    results.to_csv('nasdaq_sl_results.csv', index=False)
-    print("✅ Data saved to 'nasdaq_sl_results.csv'")
+    # --- SINGLE RUN MODE ---
+    else:
+        sim = simulations[0]
+        kpis = calculate_kpis(sim)
+        
+        print("\n" + "="*60)
+        print(f"📊 SINGLE RUN REPORT")
+        print("="*60)
+        for k, v in kpis.items():
+            print(f"   {k:<15}: {v:.2f}")
+            
+        # Save Trades
+        trade_file = f"trades_single_{timestamp}.csv"
+        sim.to_csv(trade_file, index=False)
+        print(f"✅ Trade Log saved to {trade_file}")
+        
+        # Plot
+        plt.figure(figsize=(12, 6))
+        plt.plot(sim['Date'], sim['Equity'], label=f"Equity (Total: {kpis['Total R']:.2f}R)")
+        plt.title(f"Equity Curve - SL: {STOP_LOSS_PCT*100}% - Friction: {ENABLE_FRICTION}")
+        plt.ylabel("Accumulated R")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plot_file = f"chart_single_{timestamp}.png"
+        plt.savefig(plot_file)
+        print(f"✅ Chart saved to {plot_file}")
 
+# ==========================================
+# MAIN
+# ==========================================
 if __name__ == "__main__":
     if API_KEY == 'YOUR_FMP_KEY':
         print("❌ ERROR: Please insert your FMP API Key")
     else:
         valid_tickers = get_nasdaq_tickers()
         if valid_tickers:
-            results = run_backtest_robust(valid_tickers)
-            generate_report(results)
+            # 1. Generate/Load Master Pool (Raw Signals)
+            master_pool = generate_master_pool(valid_tickers)
+            
+            if not master_pool.empty:
+                # 2. Run Simulation (Applies Friction & Limits)
+                sim_results = run_simulation(master_pool)
+                
+                # 3. Generate Report
+                generate_report(sim_results)
