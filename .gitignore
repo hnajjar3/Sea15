@@ -6,3 +6,12 @@
 /market_data_cache
 *.png
 *.csv
+*.db
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
