@@ -6,16 +6,16 @@ import csv
 import time
 import schedule
 import random
+import threading
 import concurrent.futures
 from datetime import datetime, timedelta
 from tenacity import retry, stop_after_attempt, wait_exponential
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderClass
+
 # ==============================================================================
-# 🌊 PROJECT SEA 15: THE TURBO CAPTAIN (MULTI-THREADED)
+# 🌊 PROJECT SEA 15: THE TURBO CAPTAIN (FINAL GOLDEN COPY)
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -32,7 +32,7 @@ MAX_WORKERS = 20  # Number of parallel threads for fetching/trading
 
 # SCHEDULE (PACIFIC TIME)
 PREP_TIME  = "06:00"   # Pre-load tickers 30 mins before open
-ENTRY_TIME = "06:30"   # Trigger exactly at Open
+ENTRY_TIME = "06:30"   # Trigger logic starts at Open
 EXIT_TIME  = "12:55"   
 REPORT_TIME = "09:00"  # Saturday
 
@@ -59,8 +59,10 @@ MIN_VOLUME = 10000
 BASE_URL = "https://financialmodelingprep.com/api/v3"
 alpaca = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 
-# Global list to hold tickers so we don't fetch them at the bell
+# Global list to hold tickers
 TICKER_UNIVERSE = []
+# Lock to prevent file corruption during parallel logging
+FILE_LOCK = threading.Lock()
 
 if not os.path.exists(REPORT_DIR):
     os.makedirs(REPORT_DIR)
@@ -85,7 +87,6 @@ def get_realtime_quotes_turbo(tickers):
     ⚡ PARALLEL FETCH: Downloads 5000+ quotes in ~1 second.
     """
     chunk_size = 500
-    # Split tickers into chunks
     batches = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
     all_quotes = []
     
@@ -101,28 +102,26 @@ def get_realtime_quotes_turbo(tickers):
     return pd.DataFrame(all_quotes)
 
 def execute_order_async(ticker, action, shares, price, gap):
-    """Worker function to execute a single order WITH ATTACHED STOP LOSS."""
+    """Worker function to execute a Bracket Order (Entry + SL)."""
     print(f"   🚀 FIRE: {action} {shares} {ticker} @ ~${price}...")
     
     side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
     
-    # 1. Calculate the Hard Stop Price based on the LIVE quote
-    # We use the 'price' passed from the scanner (which is the live quote)
+    # 1. Calculate Hard Stop Price
     if action == "BUY":
         stop_price = round(price * (1 - STOP_BUFFER), 2)
     else: # SHORT
         stop_price = round(price * (1 + STOP_BUFFER), 2)
 
     try:
-        # 2. Construct the Bracket Order
-        # This sends: Market Entry + Stop Loss Exit simultaneously
+        # 2. Construct Bracket Order
         order_data = MarketOrderRequest(
             symbol=ticker,
             qty=shares,
             side=side,
             time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.BRACKET,  # <--- Tells Alpaca this is a complex order
-            stop_loss=StopLossRequest(stop_price=stop_price) # <--- The Protection
+            order_class=OrderClass.BRACKET,  # <--- SAFETY ON
+            stop_loss=StopLossRequest(stop_price=stop_price)
         )
         
         alpaca.submit_order(order_data)
@@ -131,7 +130,6 @@ def execute_order_async(ticker, action, shares, price, gap):
         log_entry(ticker, action, price, gap, shares)
         print(f"   ✅ SENT: {ticker} (SL: ${stop_price})")
         return True
-        
     except Exception as e:
         print(f"   ❌ ERROR {ticker}: {e}")
         return False
@@ -149,13 +147,16 @@ def check_market_status():
     except: return True 
 
 def log_entry(ticker, type_, price, gap, shares):
+    """Thread-safe logging to CSV."""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     file_exists = os.path.isfile(LOG_FILE)
-    with open(LOG_FILE, 'a', newline='') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(['Date', 'Ticker', 'Type', 'Entry', 'Gap', 'Shares'])
-        writer.writerow([timestamp, ticker, type_, price, gap, shares])
+    
+    with FILE_LOCK:  # <--- Critical for multi-threading
+        with open(LOG_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(['Date', 'Ticker', 'Type', 'Entry', 'Gap', 'Shares'])
+            writer.writerow([timestamp, ticker, type_, price, gap, shares])
 
 # ------------------------------------------------------------------------------
 # 5. CORE LOGIC JOBS
@@ -202,7 +203,6 @@ def job_entry_scan_turbo():
     if df.empty: return
 
     # 3. PROCESS GAPS
-    # We use 'price' (Realtime) vs 'previousClose'
     df = df.dropna(subset=['price', 'previousClose'])
     df = df[ (df['price'] > 0) & (df['previousClose'] > 0) ].copy()
     df['gap_pct'] = (df['price'] - df['previousClose']) / df['previousClose']
@@ -316,21 +316,22 @@ if __name__ == "__main__":
     print(f"⏰ Entry: {ENTRY_TIME} (PT) + {SECONDS_DELAY}s delay")
     print(f"⏰ Exit:  {EXIT_TIME} (PT)")
     print(f"🚀 Speed: Multi-Threaded ({MAX_WORKERS} Workers)")
+    print(f"🛡️ Safety: Bracket Orders (Auto-SL attached)")
     
     # 1. Pre-Market Prep
     schedule.every().day.at(PREP_TIME).do(job_update_universe)
     
-    # 2. The Trade Trigger (Starts at 06:30, waits 15s internal)
+    # 2. The Trade Trigger
     schedule.every().day.at(ENTRY_TIME).do(job_entry_scan_turbo)
     
     # 3. Exit & Report
     schedule.every().day.at(EXIT_TIME).do(job_exit_flatten)
     schedule.every().saturday.at(REPORT_TIME).do(job_weekly_report)
 
-    # Run Prep immediately if starting during the day for testing
+    # Run Prep immediately if starting mid-day
     if not TICKER_UNIVERSE:
         job_update_universe()
 
     while True:
         schedule.run_pending()
-        time.sleep(1) # Tighter loop for responsiveness
+        time.sleep(1)
