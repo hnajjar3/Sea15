@@ -26,7 +26,7 @@ SMA_PERIOD = 10              # Trend definition
 
 # *** VOLUME SOFT CAP ***
 MIN_VOLUME = 50_000          # The Floor (Hard Filter)
-MAX_VOLUME = 500_000         # <--- NEW: The Soft Ceiling (500k)
+MAX_VOLUME = 600_000         # <--- NEW: The Soft Ceiling (500k)
 HIGH_VOL_SAMPLE_RATE = 0.10  # <--- NEW: Only keep 10% of stocks above MAX_VOLUME
 
 # API & DATA
@@ -40,7 +40,7 @@ GAP_UP_MIN, GAP_UP_MAX = 0.05, 0.13
 GAP_DOWN_THRESHOLD = -0.05
 MIN_PRICE, MAX_PRICE = 1.00, 50.00
 LOOKBACK_DAYS = 1095        # 3 Years
-STOP_LOSS_PCT = 0.05        # 5% Stop Loss
+STOP_LOSS_PCT = 0.03        # 5% Stop Loss
 
 # SIMULATION PARAMS
 MAX_TRADES_PER_DAY = 10     
