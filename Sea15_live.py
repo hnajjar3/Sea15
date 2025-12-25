@@ -6,15 +6,15 @@ import csv
 import time
 import schedule
 import random
+import concurrent.futures
 from datetime import datetime, timedelta
 from tenacity import retry, stop_after_attempt, wait_exponential
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 
-
 # ==============================================================================
-# 🌊 PROJECT SEA 15: THE CAPTAIN (FINAL GOLDEN COPY)
+# 🌊 PROJECT SEA 15: THE TURBO CAPTAIN (MULTI-THREADED)
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -27,81 +27,114 @@ ALPACA_SECRET = "AS4aE8iuwj4nB1YUoMCHamSfBcodV6sX3i5cCdYLuS3M"
 # SYSTEM SETTINGS
 LOG_FILE = "sea15_live_log.csv"
 REPORT_DIR = "weekly_reports"
+MAX_WORKERS = 20  # Number of parallel threads for fetching/trading
 
-# SCHEDULE (PACIFIC TIME as requested: 06:35 = 9:35 ET)
-ENTRY_TIME = "06:35"   
+# SCHEDULE (PACIFIC TIME)
+PREP_TIME  = "06:00"   # Pre-load tickers 30 mins before open
+ENTRY_TIME = "06:30"   # Trigger exactly at Open
 EXIT_TIME  = "12:55"   
-REPORT_TIME = "09:00"  # Saturday Morning Report
+REPORT_TIME = "09:00"  # Saturday
+
+# EXECUTION TIMING
+SECONDS_DELAY = 15     # Wait 15s after open for volatility to stabilize
 
 # RISK MANAGEMENT
-RISK_PER_TRADE = 1000.00       
+RISK_PER_TRADE = 1000.00        
 STOP_BUFFER = 0.05             
-MAX_SHORTS = 5         # Daily Limit (Matches Backtest)
-MAX_LONGS = 5          # Daily Limit (Matches Backtest)
+MAX_SHORTS = 5         
+MAX_LONGS = 5          
 
-# OPTIMIZED STRATEGY PARAMETERS (MATCHING ROBUST BACKTEST)
+# STRATEGY PARAMETERS
 GAP_UP_MIN = 0.05              
-GAP_UP_MAX = 0.13      # Cap at 13%
+GAP_UP_MAX = 0.13      
 GAP_DOWN_THRESHOLD = -0.05     
-MIN_PRICE = 1.00       # Matches Backtest
-MAX_PRICE = 50.00      # Matches Backtest
-MIN_VOLUME = 10000     # Liquidity Filter
+MIN_PRICE = 1.00       
+MAX_PRICE = 50.00      
+MIN_VOLUME = 10000     
 
 # ------------------------------------------------------------------------------
-# 2. SETUP CLIENTS
+# 2. SETUP CLIENTS & GLOBAL STATE
 # ------------------------------------------------------------------------------
 BASE_URL = "https://financialmodelingprep.com/api/v3"
 alpaca = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 
+# Global list to hold tickers so we don't fetch them at the bell
+TICKER_UNIVERSE = []
+
 if not os.path.exists(REPORT_DIR):
     os.makedirs(REPORT_DIR)
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
-def fetch_url(url):
+# ------------------------------------------------------------------------------
+# 3. HIGH-SPEED NETWORK FUNCTIONS
+# ------------------------------------------------------------------------------
+def fetch_batch_quotes(tickers):
+    """Worker function to fetch a single batch of quotes."""
+    if not tickers: return []
     try:
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200: return response.json()
+        url = f"{BASE_URL}/quote/{','.join(tickers)}?apikey={FMP_API_KEY}"
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            return response.json()
         return []
-    except: return []
+    except:
+        return []
+
+def get_realtime_quotes_turbo(tickers):
+    """
+    ⚡ PARALLEL FETCH: Downloads 5000+ quotes in ~1 second.
+    """
+    chunk_size = 500
+    # Split tickers into chunks
+    batches = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+    all_quotes = []
+    
+    print(f"⚡ TURBO FETCH: Launching {len(batches)} parallel requests...")
+    start_ts = time.time()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(fetch_batch_quotes, batch) for batch in batches]
+        for future in concurrent.futures.as_completed(futures):
+            all_quotes.extend(future.result())
+            
+    print(f"⚡ FETCH COMPLETE: {len(all_quotes)} quotes in {time.time() - start_ts:.2f}s")
+    return pd.DataFrame(all_quotes)
+
+def execute_order_async(ticker, action, shares, price, gap):
+    """Worker function to execute a single order."""
+    print(f"   🚀 FIRE: {action} {shares} {ticker}...")
+    
+    side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
+    try:
+        # Check tradability inside the thread (fast check)
+        # Note: In ultra-fast mode, we might skip is_tradable() check to save time,
+        # relying on Alpaca to reject it if invalid. Here we send it directly.
+        
+        order_data = MarketOrderRequest(
+            symbol=ticker, qty=shares, side=side, time_in_force=TimeInForce.DAY
+        )
+        alpaca.submit_order(order_data)
+        
+        # Log success
+        log_entry(ticker, action, price, gap, shares)
+        print(f"   ✅ SENT: {ticker}")
+        return True
+    except Exception as e:
+        print(f"   ❌ ERROR {ticker}: {e}")
+        return False
 
 # ------------------------------------------------------------------------------
-# 3. HELPER FUNCTIONS
+# 4. STANDARD HELPERS
 # ------------------------------------------------------------------------------
 def check_market_status():
     try:
         clock = alpaca.get_clock()
         if not clock.is_open:
-            print(f"💤 Market is CLOSED today. Next open: {clock.next_open}")
+            print(f"💤 Market is CLOSED. Next open: {clock.next_open}")
             return False
         return True
     except: return True 
 
-def is_tradable(ticker):
-    try:
-        asset = alpaca.get_asset(ticker)
-        return asset.tradable and asset.status == 'active'
-    except: return False
-
-def execute_alpaca_order(ticker, action, shares):
-    print(f"   🚀 SENDING: {action} {shares} {ticker}...")
-    if not is_tradable(ticker):
-        print(f"   ❌ SKIPPED: {ticker} not tradable.")
-        return False
-
-    side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
-    try:
-        order_data = MarketOrderRequest(
-            symbol=ticker, qty=shares, side=side, time_in_force=TimeInForce.DAY
-        )
-        alpaca.submit_order(order_data)
-        print(f"   ✅ FILLED: {ticker}")
-        return True
-    except Exception as e:
-        print(f"   ❌ FAILED: {e}")
-        return False
-
 def log_entry(ticker, type_, price, gap, shares):
-    # Logs the entry signal to a simple CSV for debugging
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     file_exists = os.path.isfile(LOG_FILE)
     with open(LOG_FILE, 'a', newline='') as f:
@@ -111,46 +144,56 @@ def log_entry(ticker, type_, price, gap, shares):
         writer.writerow([timestamp, ticker, type_, price, gap, shares])
 
 # ------------------------------------------------------------------------------
-# 4. TRADING LOGIC
+# 5. CORE LOGIC JOBS
 # ------------------------------------------------------------------------------
-def get_nasdaq_tickers():
-    print("📡 Fetching Real-Time Ticker List from FMP...")
-    # 'volumeMoreThan' ensures we only look at liquid stocks
-    url = f"{BASE_URL}/stock-screener?exchange=nasdaq&limit=5000&volumeMoreThan={MIN_VOLUME}&priceMoreThan={MIN_PRICE}&apikey={FMP_API_KEY}"
-    data = fetch_url(url)
-    if isinstance(data, list):
-        return [x['symbol'] for x in data]
-    return []
-
-def get_realtime_quotes(tickers):
-    chunk_size = 500
-    all_quotes = []
-    print(f"⚡ Fetching Quotes for {len(tickers)} tickers...")
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i:i+chunk_size]
-        url = f"{BASE_URL}/quote/{','.join(chunk)}?apikey={FMP_API_KEY}"
-        data = fetch_url(url)
-        if isinstance(data, list): all_quotes.extend(data)
-    return pd.DataFrame(all_quotes)
-
-def job_entry_scan():
+def job_update_universe():
+    """Runs Pre-Market to load the gun."""
+    global TICKER_UNIVERSE
     print("\n" + "="*60)
-    print(f"🌊 SEA 15 ENTRY SCAN | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📡 PRE-MARKET PREP | {datetime.now().strftime('%H:%M:%S')}")
+    print("="*60)
+    
+    url = f"{BASE_URL}/stock-screener?exchange=nasdaq&limit=6000&volumeMoreThan={MIN_VOLUME}&priceMoreThan={MIN_PRICE}&apikey={FMP_API_KEY}"
+    try:
+        data = requests.get(url).json()
+        if isinstance(data, list):
+            TICKER_UNIVERSE = [x['symbol'] for x in data]
+            print(f"✅ UNIVERSE UPDATED: {len(TICKER_UNIVERSE)} tickers ready in memory.")
+        else:
+            print("❌ FAILED to download ticker list.")
+    except Exception as e:
+        print(f"❌ ERROR: {e}")
+
+def job_entry_scan_turbo():
+    global TICKER_UNIVERSE
+    
+    print("\n" + "="*60)
+    print(f"🌊 SEA 15 TURBO SCAN | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
 
     if not check_market_status(): return
+    
+    # 0. WAIT FOR DUST TO SETTLE
+    print(f"⏳ Market Open. Waiting {SECONDS_DELAY}s for liquidity...")
+    time.sleep(SECONDS_DELAY)
 
-    tickers = get_nasdaq_tickers()
-    if not tickers: return
-    df = get_realtime_quotes(tickers)
+    # 1. CHECK UNIVERSE
+    if not TICKER_UNIVERSE:
+        print("⚠️ Universe empty. Emergency fetch...")
+        job_update_universe()
+        if not TICKER_UNIVERSE: return
+
+    # 2. FAST FETCH
+    df = get_realtime_quotes_turbo(TICKER_UNIVERSE)
     if df.empty: return
 
-    # Process Gaps
-    df = df.dropna(subset=['open', 'previousClose', 'price'])
-    df = df[ (df['open'] > 0) & (df['previousClose'] > 0) ].copy()
-    df['gap_pct'] = (df['open'] - df['previousClose']) / df['previousClose']
+    # 3. PROCESS GAPS
+    # We use 'price' (Realtime) vs 'previousClose'
+    df = df.dropna(subset=['price', 'previousClose'])
+    df = df[ (df['price'] > 0) & (df['previousClose'] > 0) ].copy()
+    df['gap_pct'] = (df['price'] - df['previousClose']) / df['previousClose']
 
-    # 1. OPTIMIZED FILTERS ($1-$50, 5-13%)
+    # 4. FILTER
     shorts = df[ 
         (df['gap_pct'] >= GAP_UP_MIN) & 
         (df['gap_pct'] <= GAP_UP_MAX) & 
@@ -164,42 +207,47 @@ def job_entry_scan():
         (df['price'] <= MAX_PRICE)
     ].copy()
 
-    # 2. RANDOM SAMPLING (The "Robust" Selection)
-    # Shuffle and pick top N to simulate random selection from valid pool
-    
-    # --- Execute Shorts ---
+    # 5. RANDOM SELECTION
+    orders_to_send = []
+
+    # --- Prepare Shorts ---
     if not shorts.empty:
         candidates = shorts.to_dict('records')
-        random.shuffle(candidates) # <--- Randomize
+        random.shuffle(candidates)
         selected = candidates[:MAX_SHORTS]
-        
-        print(f"\n🐻 FOUND {len(shorts)} VALID SHORTS. RANDOMLY SELECTED {len(selected)}:")
+        print(f"\n🐻 SHORTS ({len(shorts)} found, picking {len(selected)}):")
         for row in selected:
-            entry = row['price']
-            shares = int(RISK_PER_TRADE / (entry * STOP_BUFFER))
+            shares = int(RISK_PER_TRADE / (row['price'] * STOP_BUFFER))
             if shares > 0:
-                print(f"   🔥 SHORT: {row['symbol']} @ ${entry} (Gap {row['gap_pct']:.1%})")
-                if execute_alpaca_order(row['symbol'], "SELL", shares):
-                    log_entry(row['symbol'], "Short", entry, row['gap_pct'], shares)
+                orders_to_send.append((row['symbol'], "SELL", shares, row['price'], row['gap_pct']))
     else:
-        print("\n🐻 No Short Signals.")
+        print("\n🐻 No Shorts.")
 
-    # --- Execute Longs ---
+    # --- Prepare Longs ---
     if not longs.empty:
         candidates = longs.to_dict('records')
         random.shuffle(candidates)
         selected = candidates[:MAX_LONGS]
-        
-        print(f"\n🐂 FOUND {len(longs)} VALID LONGS. RANDOMLY SELECTED {len(selected)}:")
+        print(f"\n🐂 LONGS ({len(longs)} found, picking {len(selected)}):")
         for row in selected:
-            entry = row['price']
-            shares = int(RISK_PER_TRADE / (entry * STOP_BUFFER))
+            shares = int(RISK_PER_TRADE / (row['price'] * STOP_BUFFER))
             if shares > 0:
-                print(f"   🔥 BUY: {row['symbol']} @ ${entry} (Gap {row['gap_pct']:.1%})")
-                if execute_alpaca_order(row['symbol'], "BUY", shares):
-                    log_entry(row['symbol'], "Long", entry, row['gap_pct'], shares)
+                orders_to_send.append((row['symbol'], "BUY", shares, row['price'], row['gap_pct']))
     else:
-        print("\n🐂 No Long Signals.")
+        print("\n🐂 No Longs.")
+
+    # 6. TURBO EXECUTION (PARALLEL)
+    if orders_to_send:
+        print(f"\n⚡ TURBO EXEC: Firing {len(orders_to_send)} Orders Simultaneously...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(execute_order_async, t, a, s, p, g) 
+                for t, a, s, p, g in orders_to_send
+            ]
+            concurrent.futures.wait(futures)
+        print("✅ EXECUTION COMPLETE.")
+    else:
+        print("💤 No valid trades to execute.")
 
 def job_exit_flatten():
     print(f"\n🛑 MARKET CLOSE - FLATTENING ACCOUNT...")
@@ -209,16 +257,11 @@ def job_exit_flatten():
     except Exception as e:
         print(f"❌ FLAT FAILED: {e}")
 
-# ------------------------------------------------------------------------------
-# 5. SATURDAY KPI REPORTING
-# ------------------------------------------------------------------------------
 def job_weekly_report():
     print("\n" + "="*60)
-    print(f"📊 GENERATING WEEKLY KPI REPORT | {datetime.now().strftime('%Y-%m-%d')}")
+    print(f"📊 WEEKLY REPORT | {datetime.now().strftime('%Y-%m-%d')}")
     print("="*60)
-    
     try:
-        # Fetch last 7 days of closed orders
         end_date = datetime.now()
         start_date = end_date - timedelta(days=7)
         req = GetOrdersRequest(status=OrderStatus.CLOSED, limit=500, after=start_date)
@@ -244,9 +287,8 @@ def job_weekly_report():
             df = pd.DataFrame(trade_list)
             filename = f"{REPORT_DIR}/weekly_ledger_{end_date.strftime('%Y-%m-%d')}.csv"
             df.to_csv(filename, index=False)
-            print(f"   ✅ Report Saved: {filename}")
-            print(f"   ✅ Total Trades: {len(df)}")
-            print(f"   ✅ Total Volume: ${df['Notional'].sum():,.2f}")
+            print(f"   ✅ Saved: {filename}")
+            print(f"   ✅ Volume: ${df['Notional'].sum():,.2f}")
             
     except Exception as e:
         print(f"   ❌ REPORT FAILED: {e}")
@@ -255,16 +297,26 @@ def job_weekly_report():
 # 6. MASTER SCHEDULER
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f"🌊 SEA 15 CAPTAIN INITIALIZED")
-    print(f"⏰ Entry: {ENTRY_TIME} | Exit: {EXIT_TIME}")
-    print(f"🎲 Mode:  Random Selection (Limit {MAX_SHORTS} Short / {MAX_LONGS} Long)")
-    print(f"📊 Report: Saturdays @ {REPORT_TIME}")
+    print(f"🌊 SEA 15 TURBO CAPTAIN INITIALIZED")
+    print(f"⏰ Prep:  {PREP_TIME} (PT)")
+    print(f"⏰ Entry: {ENTRY_TIME} (PT) + {SECONDS_DELAY}s delay")
+    print(f"⏰ Exit:  {EXIT_TIME} (PT)")
+    print(f"🚀 Speed: Multi-Threaded ({MAX_WORKERS} Workers)")
     
-    # Schedule
-    schedule.every().day.at(ENTRY_TIME).do(job_entry_scan)
+    # 1. Pre-Market Prep
+    schedule.every().day.at(PREP_TIME).do(job_update_universe)
+    
+    # 2. The Trade Trigger (Starts at 06:30, waits 15s internal)
+    schedule.every().day.at(ENTRY_TIME).do(job_entry_scan_turbo)
+    
+    # 3. Exit & Report
     schedule.every().day.at(EXIT_TIME).do(job_exit_flatten)
     schedule.every().saturday.at(REPORT_TIME).do(job_weekly_report)
 
+    # Run Prep immediately if starting during the day for testing
+    if not TICKER_UNIVERSE:
+        job_update_universe()
+
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        time.sleep(1) # Tighter loop for responsiveness
