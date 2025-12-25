@@ -9,6 +9,12 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # ==========================================
 # CONFIGURATION
 # ==========================================
+# NEW GLOBALS
+BENCHMARK_TICKER = 'QQQ'
+RISK_FREE_RATE = 0.03
+VAR_CONFIDENCE = 0.95
+STARTING_CAPITAL = 100000
+
 # TOGGLES
 ENABLE_MC = True             # Set to True for Monte Carlo, False for Single Run
 ENABLE_FRICTION = True       # Set to True to include Slippage & Commissions
@@ -407,6 +413,190 @@ def generate_report(simulations):
         print(f"✅ Chart saved to {plot_file}")
 
 # ==========================================
+# 5. ADVANCED ANALYTICS & REPORTING
+# ==========================================
+def get_benchmark_data():
+    """Fetches benchmark (QQQ) data for the simulation period."""
+    print(f"📡 Fetching Benchmark ({BENCHMARK_TICKER}) Data...")
+    df = get_historical_data(BENCHMARK_TICKER)
+    if df.empty:
+        print("⚠️ Benchmark data empty!")
+        return pd.Series(dtype=float)
+
+    df = df.sort_index()
+    return df['close'].pct_change().fillna(0)
+
+def process_portfolio_daily(sim_trades, benchmark_ret):
+    """
+    Converts list of trades into a daily equity curve and merges with benchmark.
+    """
+    if sim_trades.empty:
+        return pd.DataFrame()
+
+    # Aggregate Trade PnL by Date
+    sim_trades = sim_trades.copy()
+    sim_trades['PnL_Dollar'] = sim_trades['Net_PnL'] * AVG_TRADE_SIZE
+
+    daily_pnl = sim_trades.groupby('Date')['PnL_Dollar'].sum()
+
+    # Create Daily Series indexed by Union of dates
+    if not daily_pnl.empty:
+        start_date = daily_pnl.index.min()
+        end_date = daily_pnl.index.max()
+
+        # Filter benchmark to sim range
+        bench_subset = benchmark_ret.loc[start_date:end_date] if not benchmark_ret.empty else pd.Series(dtype=float)
+
+        # Create Union Index to ensure no data is lost
+        full_index = daily_pnl.index.union(bench_subset.index).sort_values()
+
+        df = pd.DataFrame(index=full_index)
+        df['Bench_Ret'] = bench_subset.reindex(full_index).fillna(0)
+        df['Daily_PnL'] = daily_pnl.reindex(full_index).fillna(0)
+
+        # Equity Curve
+        df['Equity'] = STARTING_CAPITAL + df['Daily_PnL'].cumsum()
+
+        # Portfolio Returns (Daily)
+        df['Prev_Equity'] = df['Equity'].shift(1).fillna(STARTING_CAPITAL)
+        df['Port_Ret'] = df['Daily_PnL'] / df['Prev_Equity']
+
+        return df
+    return pd.DataFrame()
+
+def calculate_advanced_metrics(daily_df):
+    """Calculates all requested KPIs."""
+    if daily_df.empty: return {}
+
+    df = daily_df.dropna().copy()
+    if df.empty: return {}
+
+    rp = df['Port_Ret']
+    rm = df['Bench_Ret']
+    rf_daily = RISK_FREE_RATE / 252.0
+
+    # 1. Annualized Return & Vol
+    ann_factor = 252
+    days = (df.index[-1] - df.index[0]).days
+    if days > 0:
+        cagr = (df['Equity'].iloc[-1] / STARTING_CAPITAL) ** (365/days) - 1
+    else:
+        cagr = 0
+
+    vol = rp.std() * np.sqrt(ann_factor)
+
+    # 2. Beta & Alpha (CAPM)
+    if len(rp) > 1 and rp.std() > 0 and rm.std() > 0:
+        cov_matrix = np.cov(rp, rm)
+        beta = cov_matrix[0, 1] / cov_matrix[1, 1]
+    else:
+        beta = 0
+
+    rp_mean = rp.mean()
+    rm_mean = rm.mean()
+    alpha_daily = rp_mean - (rf_daily + beta * (rm_mean - rf_daily))
+    alpha_ann = alpha_daily * ann_factor
+
+    # 3. Treynor Ratio
+    rp_ann = rp_mean * ann_factor
+    if abs(beta) > 0.0001:
+        treynor = (rp_ann - RISK_FREE_RATE) / beta
+    else:
+        treynor = np.nan
+
+    # 4. Information Ratio
+    active_ret = rp - rm
+    tracking_error = active_ret.std() * np.sqrt(ann_factor)
+    if tracking_error > 0:
+        info_ratio = (active_ret.mean() * ann_factor) / tracking_error
+    else:
+        info_ratio = np.nan
+
+    # 5. Calmar Ratio
+    df['HWM'] = df['Equity'].cummax()
+    df['DD_Pct'] = (df['Equity'] - df['HWM']) / df['HWM']
+    max_dd = df['DD_Pct'].min()
+    if max_dd < 0:
+        calmar = cagr / abs(max_dd)
+    else:
+        calmar = np.nan
+
+    # 6. Omega Ratio
+    threshold = rf_daily
+    excess = rp - threshold
+    positive_sum = excess[excess > 0].sum()
+    negative_sum = abs(excess[excess < 0].sum())
+    if negative_sum > 0:
+        omega = positive_sum / negative_sum
+    else:
+        omega = np.inf
+
+    # 7. VaR (95%)
+    var_95 = np.percentile(rp, (1 - VAR_CONFIDENCE) * 100)
+
+    # 8. CVaR (95%)
+    cvar_95 = rp[rp <= var_95].mean()
+
+    # Sharpe/Sortino
+    sharpe = (rp_ann - RISK_FREE_RATE) / vol if vol > 0 else 0
+    downside_std = rp[rp < 0].std() * np.sqrt(ann_factor)
+    sortino = (rp_ann - RISK_FREE_RATE) / downside_std if downside_std > 0 else 0
+
+    return {
+        'CAGR': cagr,
+        'Vol (Ann)': vol,
+        'Sharpe': sharpe,
+        'Sortino': sortino,
+        'Max DD %': max_dd,
+        'Beta': beta,
+        'Alpha (Ann)': alpha_ann,
+        'Treynor': treynor,
+        'Info Ratio': info_ratio,
+        'Calmar': calmar,
+        'Omega': omega,
+        'VaR 95% (Daily)': var_95,
+        'CVaR 95% (Daily)': cvar_95
+    }
+
+def generate_excel_report_full(simulations, benchmark_data):
+    if not simulations: return
+
+    # Use Median Run
+    final_equities = [sim['Equity'].iloc[-1] for sim in simulations]
+    median_idx = np.argsort(final_equities)[len(final_equities)//2]
+    best_sim = simulations[median_idx]
+
+    print(f"\n📝 Generating Excel Report (Using Median Run #{best_sim['Sim_ID'].iloc[0]})...")
+
+    daily_df = process_portfolio_daily(best_sim, benchmark_data)
+    metrics = calculate_advanced_metrics(daily_df)
+
+    filename = f"Sea15_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+
+    try:
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Summary
+            summary_series = pd.Series(metrics, name="Value")
+            summary_series.to_excel(writer, sheet_name="Summary")
+
+            # Weekly Analysis
+            if not daily_df.empty:
+                w_df = daily_df.resample('W').agg({
+                    'Daily_PnL': 'sum',
+                    'Equity': 'last',
+                    'Port_Ret': lambda x: (1+x).prod() - 1
+                })
+                w_df.to_excel(writer, sheet_name="Weekly_Analysis")
+
+                daily_df.to_excel(writer, sheet_name="Daily_Log")
+
+            best_sim.to_excel(writer, sheet_name="Trade_Ledger", index=False)
+
+        print(f"✅ Excel Report saved to {filename}")
+    except Exception as e:
+        print(f"❌ Error saving Excel report: {e}")
+
+# ==========================================
 # MAIN
 # ==========================================
 if __name__ == "__main__":
@@ -415,6 +605,9 @@ if __name__ == "__main__":
     else:
         valid_tickers = get_nasdaq_tickers()
         if valid_tickers:
+            # Fetch Benchmark Data
+            bench_ret = get_benchmark_data()
+
             # 1. Generate/Load Master Pool (Raw Signals)
             master_pool = generate_master_pool(valid_tickers)
             
@@ -424,3 +617,6 @@ if __name__ == "__main__":
                 
                 # 3. Generate Report
                 generate_report(sim_results)
+
+                # 4. New Excel Report
+                generate_excel_report_full(sim_results, bench_ret)
