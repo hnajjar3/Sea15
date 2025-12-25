@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+from joblib import Parallel, delayed
 from datetime import datetime, timedelta
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -19,9 +20,14 @@ STARTING_CAPITAL = 100000
 ENABLE_MC = True             # Set to True for Monte Carlo, False for Single Run
 ENABLE_FRICTION = True       # Set to True to include Slippage & Commissions
 
-# *** CRITICAL: TREND FILTER RESTORED ***
-ENABLE_TREND_FILTER = True   # <--- The only way to win in liquid markets
-SMA_PERIOD = 50              # Trend definition
+# *** TREND FILTER ***
+ENABLE_TREND_FILTER = False   # <--- Keep True for safety in liquid markets
+SMA_PERIOD = 10              # Trend definition
+
+# *** VOLUME SOFT CAP ***
+MIN_VOLUME = 50_000          # The Floor (Hard Filter)
+MAX_VOLUME = 500_000         # <--- NEW: The Soft Ceiling (500k)
+HIGH_VOL_SAMPLE_RATE = 0.10  # <--- NEW: Only keep 10% of stocks above MAX_VOLUME
 
 # API & DATA
 API_KEY = 'iuRa8nmjQdLOx66QtJiSWFitzOMqu6QF' 
@@ -33,17 +39,16 @@ MASTER_POOL_FILE = 'sea_master_pool_unified.csv'
 GAP_UP_MIN, GAP_UP_MAX = 0.05, 0.13
 GAP_DOWN_THRESHOLD = -0.05
 MIN_PRICE, MAX_PRICE = 1.00, 50.00
-MIN_VOLUME = 50_000         # 50k Floor
 LOOKBACK_DAYS = 1095        # 3 Years
-STOP_LOSS_PCT = 0.15        # 15% Stop Loss
+STOP_LOSS_PCT = 0.05        # 5% Stop Loss
 
 # SIMULATION PARAMS
 MAX_TRADES_PER_DAY = 10     
 NUM_SIMULATIONS = 50        
 FORCE_UPDATE = False        
-FORCE_REGEN_POOL = True     # Set True once to rebuild with SMA & Volume columns
+FORCE_REGEN_POOL = False     # Set True once to ensure Volume column exists
 
-# FRICTION PARAMS (Realistic for >50k Volume)
+# FRICTION PARAMS
 SLIPPAGE_PCT = 0.001        # 0.1% per side
 COMMISSION_PER_TRADE = 1.00 
 AVG_TRADE_SIZE = 2000       
@@ -118,17 +123,18 @@ def get_historical_data(ticker):
         return pd.DataFrame()
 
 # ==========================================
-# 2. MASTER POOL GENERATION (WITH SMA & VOL)
+# 2. MASTER POOL GENERATION
 # ==========================================
+
 def generate_master_pool(tickers):
     if not FORCE_REGEN_POOL and os.path.exists(MASTER_POOL_FILE):
         print(f"📂 Loading Master Signal Pool from {MASTER_POOL_FILE}...")
         pool = pd.read_csv(MASTER_POOL_FILE)
-        # Validation
-        required_cols = ['Trend_Aligned', 'Volume']
+        # Check if new MCMC columns exist, otherwise regenerate
+        required_cols = ['Trend_Aligned', 'Volume', 'Raw_PnL', 'High', 'Gap_Pct']
         if all(col in pool.columns for col in required_cols):
             return pool
-        print("⚠️ Pool missing columns. Regenerating...")
+        print("⚠️ Pool missing columns (MCMC data). Regenerating...")
 
     print(f"⚡ Generating Signal Pool (Filter: {ENABLE_TREND_FILTER}, SMA: {SMA_PERIOD})...")
     all_signals = []
@@ -139,13 +145,13 @@ def generate_master_pool(tickers):
         df = get_historical_data(ticker)
         if df.empty or len(df) < SMA_PERIOD + 5: continue
             
-        # 1. Techs
+        # Techs
         df['vol_prev'] = df['volume'].shift(1)
         df['sma'] = df['close'].rolling(window=SMA_PERIOD).mean().shift(1)
         df['prev_close'] = df['close'].shift(1)
         df['gap_pct'] = (df['open'] - df['prev_close']) / df['prev_close']
         
-        # 2. Filter Validity
+        # Filter Validity (Min Volume Only)
         df = df[(df['open'] > MIN_PRICE) & (df['vol_prev'] > MIN_VOLUME)].copy()
         
         # --- SHORTS ---
@@ -153,12 +159,10 @@ def generate_master_pool(tickers):
         if short_mask.any():
             shorts = df[short_mask].copy()
             for date, row in shorts.iterrows():
-                # Trend Logic: Aligned if Open < SMA
                 is_aligned = True
                 if ENABLE_TREND_FILTER:
                     is_aligned = row['open'] < row['sma']
                 
-                # PnL Logic
                 entry = row['open']
                 stop = entry * (1 + STOP_LOSS_PCT)
                 
@@ -169,12 +173,21 @@ def generate_master_pool(tickers):
                     raw_pnl = (entry - row['close']) / entry
                     outcome = 'Win' if raw_pnl > 0 else 'Loss'
 
+                # MERGED DICTIONARY (Original + New MCMC Fields)
                 all_signals.append({
-                    'Date': date, 'Ticker': ticker, 'Type': 'Short',
-                    'Raw_PnL': raw_pnl, 'Outcome': outcome,
+                    'Date': date, 
+                    'Ticker': ticker, 
+                    'Type': 'Short',
+                    'Raw_PnL': raw_pnl,          # <--- Critical for Simulation
+                    'Outcome': outcome,
+                    'Trend_Aligned': is_aligned,
                     'Entry_Price': entry,
                     'Volume': row['vol_prev'],
-                    'Trend_Aligned': is_aligned
+                    # NEW FIELDS FOR MCMC:
+                    'High': row['high'],  
+                    'Low': row['low'],    
+                    'Close': row['close'],
+                    'Gap_Pct': row['gap_pct']
                 })
 
         # --- LONGS ---
@@ -182,7 +195,6 @@ def generate_master_pool(tickers):
         if long_mask.any():
             longs = df[long_mask].copy()
             for date, row in longs.iterrows():
-                # Trend Logic: Aligned if Open > SMA
                 is_aligned = True
                 if ENABLE_TREND_FILTER:
                     is_aligned = row['open'] > row['sma']
@@ -197,12 +209,21 @@ def generate_master_pool(tickers):
                     raw_pnl = (row['close'] - entry) / entry
                     outcome = 'Win' if raw_pnl > 0 else 'Loss'
 
+                # MERGED DICTIONARY (Original + New MCMC Fields)
                 all_signals.append({
-                    'Date': date, 'Ticker': ticker, 'Type': 'Long',
-                    'Raw_PnL': raw_pnl, 'Outcome': outcome,
+                    'Date': date, 
+                    'Ticker': ticker, 
+                    'Type': 'Long',
+                    'Raw_PnL': raw_pnl,          # <--- Critical for Simulation
+                    'Outcome': outcome,
+                    'Trend_Aligned': is_aligned,
                     'Entry_Price': entry,
                     'Volume': row['vol_prev'],
-                    'Trend_Aligned': is_aligned
+                    # NEW FIELDS FOR MCMC:
+                    'High': row['high'], 
+                    'Low': row['low'],   
+                    'Close': row['close'],
+                    'Gap_Pct': row['gap_pct']
                 })
 
     pool_df = pd.DataFrame(all_signals)
@@ -210,7 +231,7 @@ def generate_master_pool(tickers):
     return pool_df
 
 # ==========================================
-# 3. SIMULATION ENGINE
+# 3. SIMULATION ENGINE (SOFT CAP APPLIED)
 # ==========================================
 def apply_friction(row):
     if not ENABLE_FRICTION: return row['Raw_PnL']
@@ -218,42 +239,135 @@ def apply_friction(row):
     total_slip = SLIPPAGE_PCT * 2
     return row['Raw_PnL'] - total_slip - comm_pct
 
-def run_simulation(master_pool):
-    print(f"\n🚀 Simulation: Filter={ENABLE_TREND_FILTER}, VolFloor={MIN_VOLUME}, Stop={STOP_LOSS_PCT*100}%")
+# ==========================================
+# OPTIMIZED SIMULATION ENGINE (NUMPY)
+# ==========================================
+def simulation_worker(dates, ticker_map, pnl_map, vol_map, type_map, seed):
+    """
+    Worker function that runs ONE simulation using pure Numpy for speed.
+    """
+    np.random.seed(seed)
+    daily_results = []
     
-    master_pool['Net_PnL'] = master_pool.apply(apply_friction, axis=1)
-    master_pool['Date'] = pd.to_datetime(master_pool['Date'])
+    unique_dates = np.unique(dates)
     
+    for d in unique_dates:
+        # 1. Get indices for this day
+        day_mask = (dates == d)
+        
+        # 2. Split by Type (Long/Short)
+        # We pre-calculated these masks, but slicing arrays is fast
+        day_indices = np.where(day_mask)[0]
+        
+        if len(day_indices) == 0: continue
+            
+        # Extract data for this day
+        curr_vols = vol_map[day_indices]
+        curr_types = type_map[day_indices]
+        curr_pnls = pnl_map[day_indices]
+        
+        # 3. Apply Soft Cap (Vectorized)
+        # Logic: Keep all Low Vol, Keep 10% of High Vol
+        high_vol_mask = curr_vols > MAX_VOLUME
+        low_vol_mask = ~high_vol_mask
+        
+        # Indices relative to the current day slice
+        high_vol_local_idx = np.where(high_vol_mask)[0]
+        low_vol_local_idx = np.where(low_vol_mask)[0]
+        
+        # Sample High Vol
+        if len(high_vol_local_idx) > 0:
+            keep_n = int(len(high_vol_local_idx) * HIGH_VOL_SAMPLE_RATE)
+            # Ensure at least 1 if exists, or strictly 10%? 
+            # Using strict rate usually, but let's ensure we don't drop everything
+            keep_n = max(1, keep_n) 
+            selected_high = np.random.choice(high_vol_local_idx, size=keep_n, replace=False)
+        else:
+            selected_high = np.array([], dtype=int)
+            
+        # Combine indices
+        kept_local_indices = np.concatenate([low_vol_local_idx, selected_high])
+        
+        if len(kept_local_indices) == 0: continue
+
+        # 4. Split Longs/Shorts from the survivor pool
+        survivor_types = curr_types[kept_local_indices]
+        survivor_indices = day_indices[kept_local_indices] # Map back to global global_idx
+        
+        short_local = np.where(survivor_types == 0)[0] # 0 for Short
+        long_local = np.where(survivor_types == 1)[0]  # 1 for Long
+        
+        # 5. Limit Selection (Max Trades Per Day)
+        limit = MAX_TRADES_PER_DAY // 2
+        
+        final_picks = []
+        
+        # Sample Shorts
+        if len(short_local) > limit:
+            picked_s = np.random.choice(short_local, size=limit, replace=False)
+            final_picks.append(survivor_indices[picked_s])
+        else:
+            final_picks.append(survivor_indices[short_local])
+            
+        # Sample Longs
+        if len(long_local) > limit:
+            picked_l = np.random.choice(long_local, size=limit, replace=False)
+            final_picks.append(survivor_indices[picked_l])
+        else:
+            final_picks.append(survivor_indices[long_local])
+            
+        # Flatten
+        final_indices = np.concatenate(final_picks).astype(int)
+        
+        # Store PnL
+        # We only need the PnL sum for the curve usually, but to match your report we need records
+        # For speed, we just sum them here, or return indices to rebuild DF later.
+        # Let's return indices to rebuild the DF accurately.
+        daily_results.append(final_indices)
+
+    return np.concatenate(daily_results)
+
+def run_simulation_optimized(master_pool):
+    print(f"\n🚀 Starting Parallel Monte Carlo ({NUM_SIMULATIONS} Runs)...")
+    
+    # 1. Pre-process Data for Numpy
+    # Filter Trend Aligned globally first if that switch is ON
+    if ENABLE_TREND_FILTER:
+        df = master_pool[master_pool['Trend_Aligned'] == True].copy()
+    else:
+        df = master_pool.copy()
+        
+    df['Net_PnL'] = df.apply(apply_friction, axis=1)
+    
+    # Convert dates to integers for fast indexing
+    df['Date_Int'] = pd.to_datetime(df['Date']).astype('int64') // 10**9 
+    
+    # Map 'Type' to int (Short=0, Long=1)
+    df['Type_Int'] = np.where(df['Type'] == 'Short', 0, 1)
+    
+    # Create Arrays
+    dates_arr = df['Date_Int'].values
+    pnl_arr = df['Net_PnL'].values
+    vol_arr = df['Volume'].values
+    type_arr = df['Type_Int'].values
+    idx_arr = df.index.values # Keep original indices to reconstruct
+    
+    # 2. Run Parallel Simulations
+    # Using joblib to utilize all CPU cores
+    results_indices = Parallel(n_jobs=-1, verbose=5)(
+        delayed(simulation_worker)(
+            dates_arr, idx_arr, pnl_arr, vol_arr, type_arr, 42 + i
+        ) for i in range(NUM_SIMULATIONS)
+    )
+    
+    # 3. Reconstruct DataFrames
     simulations = []
-    
-    for i in range(NUM_SIMULATIONS):
-        if (i+1) % 10 == 0: print(f"   Simulating Run {i+1}...")
-        seed = 42 + i
-        sim_trades = []
-        
-        for date, group in master_pool.groupby('Date'):
-            shorts = group[group['Type'] == 'Short']
-            longs = group[group['Type'] == 'Long']
-            
-            # Apply Filter
-            if ENABLE_TREND_FILTER:
-                shorts = shorts[shorts['Trend_Aligned'] == True]
-                longs = longs[longs['Trend_Aligned'] == True]
-            
-            # Sample
-            limit = MAX_TRADES_PER_DAY // 2
-            if len(shorts) > limit: shorts = shorts.sample(n=limit, random_state=seed)
-            if len(longs) > limit: longs = longs.sample(n=limit, random_state=seed)
-            
-            sim_trades.extend(shorts.to_dict('records'))
-            sim_trades.extend(longs.to_dict('records'))
-            
-        sim_df = pd.DataFrame(sim_trades)
-        if sim_df.empty: continue
-        
+    print("📊 Reconstructing Trade Logs...")
+    for i, indices in enumerate(results_indices):
+        sim_df = df.loc[indices].copy()
+        sim_df['Sim_ID'] = i + 1
         sim_df = sim_df.sort_values('Date')
         sim_df['Equity'] = sim_df['Net_PnL'].cumsum()
-        sim_df['Sim_ID'] = i + 1
         simulations.append(sim_df)
         
     return simulations
@@ -265,10 +379,7 @@ def analyze_by_volume(master_pool):
     print("\n🔬 Analyzing Performance by Volume...")
     if 'Volume' not in master_pool.columns: return
 
-    # Filter only the trades that WOULD be taken (Trend Aligned)
-    # Also ensure Net_PnL is present
     if 'Net_PnL' not in master_pool.columns:
-        # Calculate it if simulation hasn't run yet
         master_pool['Net_PnL'] = master_pool.apply(apply_friction, axis=1)
 
     if ENABLE_TREND_FILTER:
@@ -280,7 +391,6 @@ def analyze_by_volume(master_pool):
         df['Vol_Bucket'] = pd.qcut(df['Volume'], q=10, labels=False)
     except: return
 
-    # Use NET PnL to see real edge after friction
     stats = df.groupby('Vol_Bucket').agg({
         'Volume': ['min', 'max', 'mean'],
         'Net_PnL': ['count', 'mean', lambda x: (x > 0).mean()]
@@ -298,109 +408,195 @@ def analyze_by_volume(master_pool):
         print(f"{i:<6} | {vol_range:<25} | {int(row['Count']):<6} | {row['Win_Rate']:6.2f}% | {row['Avg_Net_PnL']:6.2f}%")
     print("="*80)
     
-    # Plot
     plt.figure(figsize=(12, 6))
     bars = plt.bar(stats.index, stats['Avg_Net_PnL'], color='skyblue', label='Net PnL %')
     ax2 = plt.gca().twinx()
     ax2.plot(stats.index, stats['Win_Rate'], color='green', marker='o', linewidth=2, label='Win Rate %')
-    
     plt.axhline(0, color='black', linewidth=1)
     plt.title(f"Net Profit by Volume (Trend Filter: {ENABLE_TREND_FILTER})")
     plt.xlabel("Volume Decile (0=Low, 9=High)")
     plt.ylabel("Avg Net PnL (%)")
     ax2.set_ylabel("Win Rate (%)")
-    
-    # Label x-axis
     plt.xticks(stats.index, [f"{x/1000:.0f}k" for x in stats['Avg_Vol']])
-    
     plt.savefig("volume_curve.png")
     print("✅ Volume Curve saved to volume_curve.png")
 
 # ==========================================
-# 5. REPORTING & VISUALIZATION (Existing)
+# 5. REPORTING
 # ==========================================
-def calculate_kpis(df):
-    """Calculates KPIs for a single dataframe of trades."""
-    if df.empty: return {}
-    wins = df[df['Net_PnL'] > 0]
-    win_rate = (len(wins) / len(df)) * 100
-    stopped = df[df['Outcome'] == 'Stopped Out']
-    stop_rate = (len(stopped) / len(df)) * 100
-    avg_ret = df['Net_PnL'].mean() * 100
-    total_r = df['Net_PnL'].sum()
-    df = df.sort_values('Date').copy() 
-    df['Equity'] = df['Net_PnL'].cumsum()
-    df['HWM'] = df['Equity'].cummax()
-    df['DD'] = df['Equity'] - df['HWM']
-    max_dd = df['DD'].min()
+def calculate_financial_metrics(sim_df, bench_ret):
+    """
+    Calculates the full 13-metric financial suite for a single simulation run.
+    """
+    # 1. Prepare Daily Equity Curve
+    sim_df = sim_df.copy()
+    
+    # --- CRITICAL FIX: Ensure dates are datetime objects ---
+    sim_df['Date'] = pd.to_datetime(sim_df['Date'])
+    
+    # Dollar PnL per day
+    daily_pnl = sim_df.groupby('Date')['Net_PnL'].sum() * AVG_TRADE_SIZE
+    
+    # Construct Equity Series
+    equity_curve = STARTING_CAPITAL + daily_pnl.cumsum()
+    equity_df = pd.DataFrame({'Equity': equity_curve})
+    
+    # Align with Benchmark
+    start_date = equity_df.index.min()
+    end_date = equity_df.index.max()
+    
+    if bench_ret.empty:
+        bench_subset = pd.Series(0, index=equity_df.index)
+    else:
+        bench_subset = bench_ret.loc[start_date:end_date]
+    
+    # Reindex to Union of dates (to handle days with no trades)
+    full_idx = equity_df.index.union(bench_subset.index).sort_values()
+    equity_df = equity_df.reindex(full_idx).ffill().fillna(STARTING_CAPITAL)
+    bench_subset = bench_subset.reindex(full_idx).fillna(0)
+    
+    # Calculate Returns
+    equity_df['Prev'] = equity_df['Equity'].shift(1).fillna(STARTING_CAPITAL)
+    rp = (equity_df['Equity'] - equity_df['Prev']) / equity_df['Prev']
+    rm = bench_subset
+    
+    # --- METRICS CALCULATION ---
+    days = (equity_df.index.max() - equity_df.index.min()).days
+    years = days / 365.25
+    if years == 0: years = 0.001
+    
+    # 1. CAGR
+    total_ret = (equity_df['Equity'].iloc[-1] / STARTING_CAPITAL)
+    cagr = (total_ret ** (1/years)) - 1
+    
+    # 2. Volatility (Annualized)
+    vol = rp.std() * np.sqrt(252)
+    
+    # 3. Sharpe Ratio
+    rf_daily = RISK_FREE_RATE / 252
+    excess_ret = rp - rf_daily
+    sharpe = (excess_ret.mean() / rp.std()) * np.sqrt(252) if rp.std() > 0 else 0
+    
+    # 4. Sortino Ratio (Downside Vol)
+    downside_std = rp[rp < 0].std() * np.sqrt(252)
+    sortino = (excess_ret.mean() * 252) / downside_std if downside_std > 0 else 0
+    
+    # 5. Max Drawdown
+    roll_max = equity_df['Equity'].cummax()
+    dd = (equity_df['Equity'] - roll_max) / roll_max
+    max_dd = dd.min()
+    
+    # 6. Beta & Alpha
+    covariance = np.cov(rp, rm)[0][1]
+    variance = np.var(rm)
+    beta = covariance / variance if variance > 0 else 0
+    
+    # Alpha (Annualized) = Rp - (Rf + Beta * (Rm - Rf))
+    # We use annualized means for this formula
+    rp_ann = rp.mean() * 252
+    rm_ann = rm.mean() * 252
+    alpha = rp_ann - (RISK_FREE_RATE + beta * (rm_ann - RISK_FREE_RATE))
+    
+    # 7. Treynor Ratio
+    treynor = (rp_ann - RISK_FREE_RATE) / beta if beta != 0 else 0
+    
+    # 8. Information Ratio
+    tracking_error = (rp - rm).std() * np.sqrt(252)
+    info_ratio = (rp_ann - rm_ann) / tracking_error if tracking_error > 0 else 0
+    
+    # 9. Calmar Ratio
+    calmar = cagr / abs(max_dd) if max_dd != 0 else 0
+    
+    # 10. Omega Ratio (Threshold 0)
+    # Simple probability weighted ratio of gains vs losses
+    gains = rp[rp > 0].sum()
+    losses = abs(rp[rp < 0].sum())
+    omega = gains / losses if losses > 0 else 0
+    
+    # 11. VaR (Value at Risk) 95% Daily
+    # The 5th percentile of daily returns
+    var_95 = np.percentile(rp, (1 - VAR_CONFIDENCE) * 100)
+    
+    # 12. CVaR (Conditional Value at Risk) 95% Daily
+    # Average of returns worse than VaR
+    cvar_95 = rp[rp <= var_95].mean()
+
+    # Basic Trade Stats
+    wins = sim_df[sim_df['Net_PnL'] > 0]
+    win_rate = (len(wins) / len(sim_df))
+    
     return {
-        'Trades': len(df),
+        'CAGR': cagr,
+        'Vol (Ann)': vol,
+        'Sharpe': sharpe,
+        'Sortino': sortino,
+        'Max DD %': max_dd,
+        'Beta': beta,
+        'Alpha (Ann)': alpha,
+        'Treynor': treynor,
+        'Info Ratio': info_ratio,
+        'Calmar': calmar,
+        'Omega': omega,
+        'VaR 95%': var_95,
+        'CVaR 95%': cvar_95,
         'Win Rate %': win_rate,
-        'Stop Rate %': stop_rate,
-        'Avg Return %': avg_ret,
-        'Total R': total_r,
-        'Max DD R': max_dd
+        'Trades': len(sim_df),
+        'Equity Curve': equity_df['Equity'] # For Charting
     }
 
-def generate_report(simulations):
-    if not simulations:
-        print("❌ No trades generated.")
-        return
+def generate_report(simulations, benchmark_ret):
+    if not simulations: return
     timestamp = datetime.now().strftime('%Y%m%d%H%M')
+    
     if ENABLE_MC:
         print(f"\n📊 MONTE CARLO REPORT ({NUM_SIMULATIONS} Runs)")
-        all_kpis = []
+        all_stats = []
         equity_curves = []
+        
         for sim in simulations:
-            kpis = calculate_kpis(sim)
-            all_kpis.append(kpis)
-            curve = sim[['Date', 'Equity']].set_index('Date')
-            curve.columns = [f"Run_{sim['Sim_ID'].iloc[0]}"]
+            metrics = calculate_financial_metrics(sim, benchmark_ret)
+            
+            # Separate the curve from the stats dict
+            curve = metrics.pop('Equity Curve')
+            curve.name = f"Run_{sim['Sim_ID'].iloc[0]}"
             equity_curves.append(curve)
-        kpi_df = pd.DataFrame(all_kpis)
-        print("="*60)
-        print(f"{'Metric':<20} | {'Mean':<10} | {'Min (Worst)':<10} | {'Max (Best)':<10}")
-        print("-" * 60)
+            
+            all_stats.append(metrics)
+            
+        kpi_df = pd.DataFrame(all_stats)
+        
+        # Format and Print
+        print("="*100)
+        print(f"{'Metric':<20} | {'Mean':<12} | {'Min (Worst)':<12} | {'Max (Best)':<12}")
+        print("-" * 100)
+        
+        pct_metrics = ['CAGR', 'Vol (Ann)', 'Max DD %', 'Win Rate %', 'VaR 95%', 'CVaR 95%', 'Alpha (Ann)']
+        
         for col in kpi_df.columns:
             mean_val = kpi_df[col].mean()
             min_val = kpi_df[col].min()
             max_val = kpi_df[col].max()
-            print(f"{col:<20} | {mean_val:10.2f} | {min_val:10.2f} | {max_val:10.2f}")
-        print("="*60)
-        summary_file = f"summary_mc_{timestamp}.csv"
-        kpi_df.to_csv(summary_file, index=False)
-        full_curves = pd.concat(equity_curves, axis=1).ffill().fillna(0)
+            
+            if col in pct_metrics:
+                print(f"{col:<20} | {mean_val*100:11.2f}% | {min_val*100:11.2f}% | {max_val*100:11.2f}%")
+            else:
+                print(f"{col:<20} | {mean_val:12.2f} | {min_val:12.2f} | {max_val:12.2f}")
+                
+        print("="*100)
+        kpi_df.to_csv(f"summary_mc_{timestamp}.csv", index=False)
+        
+        # Charting
+        full_curves = pd.concat(equity_curves, axis=1).ffill().fillna(STARTING_CAPITAL)
         plt.figure(figsize=(12, 8))
         for col in full_curves.columns:
             plt.plot(full_curves.index, full_curves[col], alpha=0.1, color='gray', linewidth=1)
         avg_curve = full_curves.mean(axis=1)
         plt.plot(avg_curve.index, avg_curve, color='#007BFF', linewidth=2.5, label='Average Outcome')
-        plt.title(f"Monte Carlo ({NUM_SIMULATIONS} Runs) - SL: {STOP_LOSS_PCT*100}% - Friction: {ENABLE_FRICTION}")
-        plt.ylabel("Accumulated R")
-        plt.legend()
-        plt.grid(True, alpha=0.2)
-        plot_file = f"chart_mc_{timestamp}.png"
-        plt.savefig(plot_file)
-        print(f"✅ Chart saved to {plot_file}")
-    else:
-        sim = simulations[0]
-        kpis = calculate_kpis(sim)
-        print("\n" + "="*60)
-        print(f"📊 SINGLE RUN REPORT")
-        print("="*60)
-        for k, v in kpis.items():
-            print(f"   {k:<15}: {v:.2f}")
-        trade_file = f"trades_single_{timestamp}.csv"
-        sim.to_csv(trade_file, index=False)
-        plt.figure(figsize=(12, 6))
-        plt.plot(sim['Date'], sim['Equity'], label=f"Equity (Total: {kpis['Total R']:.2f}R)")
-        plt.title(f"Equity Curve - SL: {STOP_LOSS_PCT*100}% - Friction: {ENABLE_FRICTION}")
-        plt.ylabel("Accumulated R")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plot_file = f"chart_single_{timestamp}.png"
-        plt.savefig(plot_file)
-        print(f"✅ Chart saved to {plot_file}")
+        plt.title(f"Monte Carlo ({NUM_SIMULATIONS} Runs) | Sharpe: {kpi_df['Sharpe'].mean():.2f} | CAGR: {kpi_df['CAGR'].mean()*100:.1f}%")
+        plt.xlabel("Date"); plt.ylabel("Equity ($)")
+        plt.legend(); plt.grid(True, alpha=0.3)
+        plt.savefig(f"chart_mc_{timestamp}.png")
+        print(f"✅ Chart saved.")
 
 def get_benchmark_data():
     print(f"📡 Fetching Benchmark ({BENCHMARK_TICKER}) Data...")
@@ -412,13 +608,23 @@ def get_benchmark_data():
 def process_portfolio_daily(sim_trades, benchmark_ret):
     if sim_trades.empty: return pd.DataFrame()
     sim_trades = sim_trades.copy()
+    
+    # Force conversion of Date column to Datetime objects to match Benchmark
+    sim_trades['Date'] = pd.to_datetime(sim_trades['Date'])
+
     sim_trades['PnL_Dollar'] = sim_trades['Net_PnL'] * AVG_TRADE_SIZE
     daily_pnl = sim_trades.groupby('Date')['PnL_Dollar'].sum()
+    
     if not daily_pnl.empty:
         start_date = daily_pnl.index.min()
         end_date = daily_pnl.index.max()
+        
+        # Slice benchmark to match simulation dates
         bench_subset = benchmark_ret.loc[start_date:end_date] if not benchmark_ret.empty else pd.Series(dtype=float)
+        
+        # Now both indexes are Datetime objects, so union/sort will work
         full_index = daily_pnl.index.union(bench_subset.index).sort_values()
+        
         df = pd.DataFrame(index=full_index)
         df['Bench_Ret'] = bench_subset.reindex(full_index).fillna(0)
         df['Daily_PnL'] = daily_pnl.reindex(full_index).fillna(0)
@@ -426,103 +632,44 @@ def process_portfolio_daily(sim_trades, benchmark_ret):
         df['Prev_Equity'] = df['Equity'].shift(1).fillna(STARTING_CAPITAL)
         df['Port_Ret'] = df['Daily_PnL'] / df['Prev_Equity']
         return df
+        
     return pd.DataFrame()
-
-def calculate_advanced_metrics(daily_df):
-    if daily_df.empty: return {}
-    df = daily_df.dropna().copy()
-    if df.empty: return {}
-    rp = df['Port_Ret']
-    rm = df['Bench_Ret']
-    rf_daily = RISK_FREE_RATE / 252.0
-    ann_factor = 252
-    days = (df.index[-1] - df.index[0]).days
-    if days > 0:
-        cagr = (df['Equity'].iloc[-1] / STARTING_CAPITAL) ** (365/days) - 1
-    else:
-        cagr = 0
-    vol = rp.std() * np.sqrt(ann_factor)
-    if len(rp) > 1 and rp.std() > 0 and rm.std() > 0:
-        cov_matrix = np.cov(rp, rm)
-        beta = cov_matrix[0, 1] / cov_matrix[1, 1]
-    else:
-        beta = 0
-    rp_mean = rp.mean()
-    rm_mean = rm.mean()
-    alpha_daily = rp_mean - (rf_daily + beta * (rm_mean - rf_daily))
-    alpha_ann = alpha_daily * ann_factor
-    rp_ann = rp_mean * ann_factor
-    if abs(beta) > 0.0001:
-        treynor = (rp_ann - RISK_FREE_RATE) / beta
-    else:
-        treynor = np.nan
-    active_ret = rp - rm
-    tracking_error = active_ret.std() * np.sqrt(ann_factor)
-    if tracking_error > 0:
-        info_ratio = (active_ret.mean() * ann_factor) / tracking_error
-    else:
-        info_ratio = np.nan
-    df['HWM'] = df['Equity'].cummax()
-    df['DD_Pct'] = (df['Equity'] - df['HWM']) / df['HWM']
-    max_dd = df['DD_Pct'].min()
-    if max_dd < 0:
-        calmar = cagr / abs(max_dd)
-    else:
-        calmar = np.nan
-    threshold = rf_daily
-    excess = rp - threshold
-    positive_sum = excess[excess > 0].sum()
-    negative_sum = abs(excess[excess < 0].sum())
-    if negative_sum > 0:
-        omega = positive_sum / negative_sum
-    else:
-        omega = np.inf
-    var_95 = np.percentile(rp, (1 - VAR_CONFIDENCE) * 100)
-    cvar_95 = rp[rp <= var_95].mean()
-    sharpe = (rp_ann - RISK_FREE_RATE) / vol if vol > 0 else 0
-    downside_std = rp[rp < 0].std() * np.sqrt(ann_factor)
-    sortino = (rp_ann - RISK_FREE_RATE) / downside_std if downside_std > 0 else 0
-    return {
-        'CAGR': cagr,
-        'Vol (Ann)': vol,
-        'Sharpe': sharpe,
-        'Sortino': sortino,
-        'Max DD %': max_dd,
-        'Beta': beta,
-        'Alpha (Ann)': alpha_ann,
-        'Treynor': treynor,
-        'Info Ratio': info_ratio,
-        'Calmar': calmar,
-        'Omega': omega,
-        'VaR 95% (Daily)': var_95,
-        'CVaR 95% (Daily)': cvar_95
-    }
 
 def generate_excel_report_full(simulations, benchmark_data):
     if not simulations: return
+    # Find the median (representative) simulation
     final_equities = [sim['Equity'].iloc[-1] for sim in simulations]
     median_idx = np.argsort(final_equities)[len(final_equities)//2]
     best_sim = simulations[median_idx]
-    print(f"\n📝 Generating Excel Report (Using Median Run #{best_sim['Sim_ID'].iloc[0]})...")
+    
+    print(f"\n📝 Generating Excel Report...")
+    
+    # 1. Generate Daily Log
     daily_df = process_portfolio_daily(best_sim, benchmark_data)
-    metrics = calculate_advanced_metrics(daily_df)
+    
+    # 2. Generate Full Financial Metrics (Re-using the robust function)
+    metrics_dict = calculate_financial_metrics(best_sim, benchmark_data)
+    
+    # Remove the large Series object so it doesn't clutter the Summary sheet
+    if 'Equity Curve' in metrics_dict:
+        del metrics_dict['Equity Curve']
+        
     filename = f"Sea15_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     try:
         with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            summary_series = pd.Series(metrics, name="Value")
+            # Summary Sheet with ALL 13 KPIs
+            summary_series = pd.Series(metrics_dict, name="Value")
             summary_series.to_excel(writer, sheet_name="Summary")
-            if not daily_df.empty:
-                w_df = daily_df.resample('W').agg({
-                    'Daily_PnL': 'sum',
-                    'Equity': 'last',
-                    'Port_Ret': lambda x: (1+x).prod() - 1
-                })
-                w_df.to_excel(writer, sheet_name="Weekly_Analysis")
-                daily_df.to_excel(writer, sheet_name="Daily_Log")
+            
+            # Daily Log Sheet
+            if not daily_df.empty: daily_df.to_excel(writer, sheet_name="Daily_Log")
+            
+            # Trade Ledger Sheet
             best_sim.to_excel(writer, sheet_name="Trade_Ledger", index=False)
+            
         print(f"✅ Excel Report saved to {filename}")
     except Exception as e:
-        print(f"❌ Error saving Excel report: {e}")
+        print(f"❌ Error saving Excel: {e}")
 
 # ==========================================
 # MAIN
@@ -536,9 +683,7 @@ if __name__ == "__main__":
             bench_ret = get_benchmark_data()
             pool = generate_master_pool(valid_tickers)
             if not pool.empty:
-                sim_results = run_simulation(pool)
-                # CALL THE ANALYSIS FUNCTION
+                sim_results = run_simulation_optimized(pool)
                 analyze_by_volume(pool)
-                
-                generate_report(sim_results)
+                generate_report(sim_results, bench_ret) 
                 generate_excel_report_full(sim_results, bench_ret)
