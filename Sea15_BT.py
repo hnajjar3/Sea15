@@ -1,5 +1,4 @@
-﻿
-import requests
+﻿import requests
 import pandas as pd
 import numpy as np
 import os
@@ -10,23 +9,16 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # ==========================================
 # CONFIGURATION
 # ==========================================
-API_KEY = 'iuRa8nmjQdLOx66QtJiSWFitzOMqu6QF'   # <--- PASTE KEY HERE
+API_KEY = 'iuRa8nmjQdLOx66QtJiSWFitzOMqu6QF' 
 BASE_URL = "https://financialmodelingprep.com/api/v3"
-
-# Cache Settings
 CACHE_DIR = 'market_data_cache'
+GAP_UP_MIN, GAP_UP_MAX = 0.05, 0.13
+GAP_DOWN_THRESHOLD = -0.05
+MIN_PRICE, MAX_PRICE = 1.00, 50.00
+MIN_VOLUME = 10000 
+LOOKBACK_DAYS = 1095
+MAX_TRADES_PER_DAY = 10  # 5 Short + 5 Long
 FORCE_UPDATE = False
-
-# Strategy Parameters
-# 1. SHORT STRATEGY (The "Sweet Spot")
-GAP_UP_MIN = 0.05       # Short > 5%
-GAP_UP_MAX = 0.15       # UPDATED: Cap at 15% to avoid "Widowmaker" squeezes
-
-# 2. LONG STRATEGY (The "Dip Buy")
-GAP_DOWN_THRESHOLD = -0.05   # Long if Gap < -5%
-
-MIN_PRICE = 2.00           # Raised to $2.00 to filter out total garbage
-LOOKBACK_DAYS = 1095       # UPDATED: 3 Years (3 * 365)
 
 # Ensure cache directory exists
 if not os.path.exists(CACHE_DIR):
@@ -65,14 +57,15 @@ def get_nasdaq_tickers():
         return pd.read_pickle(cache_path)
     
     print("📡 Fetching new Ticker List from FMP...")
+    # We ask for a broader list, but filter strictly later
     endpoint = f"{BASE_URL}/stock-screener?exchange=nasdaq&limit=10000&apikey={API_KEY}"
     try:
         data = fetch_url(endpoint)
         if isinstance(data, list):
             df = pd.DataFrame(data)
-            # Pre-filter for liquidity to save time
+            # Basic pre-filter to reduce download size
             if 'price' in df.columns and 'volume' in df.columns:
-                df = df[ (df['price'] > 1.00) & (df['volume'] > 10000) ]
+                df = df[ (df['price'] > 0.50) & (df['volume'] > 1000) ]
             tickers = df['symbol'].tolist()
             pd.to_pickle(tickers, cache_path)
             return tickers
@@ -86,8 +79,6 @@ def get_historical_data(ticker):
     # Check if cache exists
     if not FORCE_UPDATE and os.path.exists(cache_path):
         df = pd.read_pickle(cache_path)
-        # We use existing cache. If you want to force redownload for 3 years data, 
-        # delete the cache folder or set FORCE_UPDATE = True
         return df
     
     end_date = datetime.now().strftime('%Y-%m-%d')
@@ -107,57 +98,86 @@ def get_historical_data(ticker):
         return pd.DataFrame()
 
 # ==========================================
-# BACKTEST LOGIC
+# BACKTEST LOGIC (OPTIMIZED)
 # ==========================================
-def run_backtest(tickers):
-    print(f"⚡ Starting Backtest on {len(tickers)} tickers...")
-    print(f"   Lookback: {LOOKBACK_DAYS} days")
-    print(f"   Settings: Short {int(GAP_UP_MIN*100)}-{int(GAP_UP_MAX*100)}%, Long Gap < {int(GAP_DOWN_THRESHOLD*100)}%")
+def run_backtest_robust(tickers):
+    print(f"⚡ Starting Robust Backtest (No Look-Ahead + Daily Limits)...")
     
-    trade_log = []
+    all_signals = []
     
     for i, ticker in enumerate(tickers):
-        if i % 100 == 0: print(f"   Processed {i}/{len(tickers)}...")
+        if i % 100 == 0: print(f"   Scanning {i}/{len(tickers)}...")
             
         df = get_historical_data(ticker)
-        
-        if df.empty or len(df) < 5:
-            continue
+        if df.empty or len(df) < 5: continue
             
-        # --- DATA CLEANING ---
-        df = df[(df['open'] > 0.01) & (df['close'] > 0.01)].copy()
+        # 1. FIX: Calculate Yesterday's Volume
+        # We shift volume by 1 so 'vol_prev' is available at 9:30 AM today
+        df['vol_prev'] = df['volume'].shift(1)
+        
+        # 2. Filter Validity
+        df = df[(df['open'] > 0.01) & (df['close'] > 0.01) & (df['vol_prev'] > MIN_VOLUME)].copy()
         
         # Calculate Gaps
         df['prev_close'] = df['close'].shift(1)
         df['gap_pct'] = (df['open'] - df['prev_close']) / df['prev_close']
         
-        # --- STRATEGY LOGIC ---
-        
-        # SHORT (Sweet Spot: 5% < Gap < 15%)
-        short_mask = (df['gap_pct'] > GAP_UP_MIN) & (df['gap_pct'] <= GAP_UP_MAX) & (df['open'] > MIN_PRICE)
+        # 3. Identify Shorts
+        short_mask = (
+            (df['gap_pct'] >= GAP_UP_MIN) & 
+            (df['gap_pct'] <= GAP_UP_MAX) & 
+            (df['open'] >= MIN_PRICE) & 
+            (df['open'] <= MAX_PRICE)
+        )
         if short_mask.any():
             shorts = df[short_mask].copy()
-            shorts['pnl_pct'] = (shorts['open'] - shorts['close']) / shorts['open']
-            
             for date, row in shorts.iterrows():
-                trade_log.append({
+                pnl = (row['open'] - row['close']) / row['open']
+                all_signals.append({
                     'Date': date, 'Ticker': ticker, 'Type': 'Short',
-                    'Price': row['open'], 'Gap': row['gap_pct'], 'PnL': row['pnl_pct']
+                    'Price': row['open'], 'Gap': row['gap_pct'], 'PnL': pnl
                 })
 
-        # LONG (Dip Buy: Gap < -5%)
-        long_mask = (df['gap_pct'] < GAP_DOWN_THRESHOLD) & (df['open'] > MIN_PRICE)
+        # 4. Identify Longs
+        long_mask = (
+            (df['gap_pct'] <= GAP_DOWN_THRESHOLD) & 
+            (df['open'] >= MIN_PRICE) & 
+            (df['open'] <= MAX_PRICE)
+        )
         if long_mask.any():
             longs = df[long_mask].copy()
-            longs['pnl_pct'] = (longs['close'] - longs['open']) / longs['open']
-            
             for date, row in longs.iterrows():
-                trade_log.append({
+                pnl = (row['close'] - row['open']) / row['open']
+                all_signals.append({
                     'Date': date, 'Ticker': ticker, 'Type': 'Long',
-                    'Price': row['open'], 'Gap': row['gap_pct'], 'PnL': row['pnl_pct']
+                    'Price': row['open'], 'Gap': row['gap_pct'], 'PnL': pnl
                 })
-                
-    return pd.DataFrame(trade_log)
+
+    # --- THE REALITY CHECK (Daily Limits) ---
+    print("🎲 Applying Daily Limit Logic (Random Selection)...")
+    full_df = pd.DataFrame(all_signals)
+    full_df['Date'] = pd.to_datetime(full_df['Date'])
+    
+    final_trades = []
+    
+    # Group by Date to simulate a single trading day
+    for date, group in full_df.groupby('Date'):
+        # Split into Short/Long
+        shorts = group[group['Type'] == 'Short']
+        longs = group[group['Type'] == 'Long']
+        
+        # Randomly pick up to 5 Shorts
+        if len(shorts) > (MAX_TRADES_PER_DAY // 2):
+            shorts = shorts.sample(n=(MAX_TRADES_PER_DAY // 2), random_state=42)
+        
+        # Randomly pick up to 5 Longs
+        if len(longs) > (MAX_TRADES_PER_DAY // 2):
+            longs = longs.sample(n=(MAX_TRADES_PER_DAY // 2), random_state=42)
+            
+        final_trades.extend(shorts.to_dict('records'))
+        final_trades.extend(longs.to_dict('records'))
+        
+    return pd.DataFrame(final_trades)
 
 # ==========================================
 # REPORTING & VISUALIZATION
@@ -168,7 +188,7 @@ def generate_report(results):
         return
 
     print("\n" + "="*60)
-    print("📊 3-YEAR STRATEGY REPORT")
+    print("📊 3-YEAR OPTIMIZED STRATEGY REPORT")
     print("="*60)
 
     results['Date'] = pd.to_datetime(results['Date'])
@@ -194,13 +214,13 @@ def generate_report(results):
         subset['DD'] = subset['Equity'] - subset['HWM']
         max_dd = subset['DD'].min()
 
-        # Weekly Stats (Added back in)
+        # Weekly Stats
         weekly_pnl = subset.set_index('Date')['PnL'].resample('W').sum()
         best_week = weekly_pnl.max()
         worst_week = weekly_pnl.min()
         
         print("\n" + "="*60)
-        print("🌊 PROJECT SEA 15: ALGORITHMIC REPORT 🌊")
+        print(f"🌊 SEA 15 OPTIMIZED: {t_type.upper()}")
         print("="*60)
         print(f"   Trades:         {len(subset)}")
         print(f"   Win Rate:       {win_rate:.2f}%")
@@ -212,16 +232,16 @@ def generate_report(results):
         
         plt.plot(subset['Date'], subset['Equity'], label=f"{t_type} ({total_pnl:.1f}R)")
 
-    plt.title(f'Equity Curve (3 Years): Short 5-15% | Long < -5%')
+    plt.title(f'Equity Curve: Gap {int(GAP_UP_MIN*100)}-{int(GAP_UP_MAX*100)}% | Price ${int(MIN_PRICE)}-${int(MAX_PRICE)}')
     plt.xlabel('Date')
     plt.ylabel('Accumulated Risk Units (R)')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig('nasdaq_3yr_curve.png')
-    print("\n✅ Chart saved to 'nasdaq_3yr_curve.png'")
+    plt.savefig('nasdaq_optimized_curve.png')
+    print("\n✅ Chart saved to 'nasdaq_optimized_curve.png'")
     
-    results.to_csv('nasdaq_3yr_results.csv', index=False)
-    print("✅ Data saved to 'nasdaq_3yr_results.csv'")
+    results.to_csv('nasdaq_optimized_results.csv', index=False)
+    print("✅ Data saved to 'nasdaq_optimized_results.csv'")
 
 if __name__ == "__main__":
     if API_KEY == 'YOUR_FMP_KEY':
@@ -230,6 +250,5 @@ if __name__ == "__main__":
         valid_tickers = get_nasdaq_tickers()
         if valid_tickers:
             # Note: Set FORCE_UPDATE = True if you need to re-download 3 years of data
-            # FORCE_UPDATE = True 
-            results = run_backtest(valid_tickers)
+            results = run_backtest_robust(valid_tickers)
             generate_report(results)
