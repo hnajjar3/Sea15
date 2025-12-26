@@ -1,4 +1,4 @@
-﻿import requests
+import requests
 import pandas as pd
 import numpy as np
 import os
@@ -40,8 +40,8 @@ REPORT_TIME = "09:00"  # Saturday
 SECONDS_DELAY = 15     # Wait 15s after open for volatility to stabilize
 
 # RISK MANAGEMENT
-RISK_PER_TRADE = 1000.00        
-STOP_BUFFER = 0.05             
+POSITION_SIZE = 2000.00        # Fixed Position Size (mimics AVG_TRADE_SIZE in BT)
+STOP_LOSS_PCT = 0.015          # 1.5% Stop Loss
 MAX_SHORTS = 5         
 MAX_LONGS = 5          
 
@@ -51,7 +51,9 @@ GAP_UP_MAX = 0.13
 GAP_DOWN_THRESHOLD = -0.05     
 MIN_PRICE = 1.00       
 MAX_PRICE = 50.00      
-MIN_VOLUME = 10000     
+MIN_VOLUME = 50000            # Increased to 50k
+MAX_VOLUME = 600000           # Soft Cap Ceiling
+HIGH_VOL_SAMPLE_RATE = 0.10   # Keep 10% of stocks > MAX_VOLUME
 
 # ------------------------------------------------------------------------------
 # 2. SETUP CLIENTS & GLOBAL STATE
@@ -109,9 +111,9 @@ def execute_order_async(ticker, action, shares, price, gap):
     
     # 1. Calculate Hard Stop Price
     if action == "BUY":
-        stop_price = round(price * (1 - STOP_BUFFER), 2)
+        stop_price = round(price * (1 - STOP_LOSS_PCT), 2)
     else: # SHORT
-        stop_price = round(price * (1 + STOP_BUFFER), 2)
+        stop_price = round(price * (1 + STOP_LOSS_PCT), 2)
 
     try:
         # 2. Construct Bracket Order
@@ -203,22 +205,43 @@ def job_entry_scan_turbo():
     if df.empty: return
 
     # 3. PROCESS GAPS
-    df = df.dropna(subset=['price', 'previousClose'])
+    df = df.dropna(subset=['price', 'previousClose', 'volume'])
     df = df[ (df['price'] > 0) & (df['previousClose'] > 0) ].copy()
     df['gap_pct'] = (df['price'] - df['previousClose']) / df['previousClose']
 
-    # 4. FILTER
-    shorts = df[ 
-        (df['gap_pct'] >= GAP_UP_MIN) & 
-        (df['gap_pct'] <= GAP_UP_MAX) & 
+    # 4. FILTER (With Volume Soft Cap)
+    # Basic Filters first
+    candidates = df[
         (df['price'] >= MIN_PRICE) & 
-        (df['price'] <= MAX_PRICE)
+        (df['price'] <= MAX_PRICE) &
+        (df['volume'] >= MIN_VOLUME)
     ].copy()
 
-    longs = df[ 
-        (df['gap_pct'] <= GAP_DOWN_THRESHOLD) & 
-        (df['price'] >= MIN_PRICE) & 
-        (df['price'] <= MAX_PRICE)
+    # Apply Volume Soft Cap (Imitate Backtest Logic)
+    # Split into High Vol and Low Vol
+    high_vol = candidates[candidates['volume'] > MAX_VOLUME].copy()
+    low_vol = candidates[candidates['volume'] <= MAX_VOLUME].copy()
+
+    # Sample High Vol
+    if not high_vol.empty:
+        # We use a random mask to keep ~10%
+        # This matches the "Soft Ceiling" logic
+        high_vol = high_vol.sample(frac=HIGH_VOL_SAMPLE_RATE)
+
+    # Recombine
+    candidates = pd.concat([low_vol, high_vol])
+
+    if candidates.empty:
+        print("💤 No candidates after filtering.")
+        return
+
+    shorts = candidates[
+        (candidates['gap_pct'] >= GAP_UP_MIN) &
+        (candidates['gap_pct'] <= GAP_UP_MAX)
+    ].copy()
+
+    longs = candidates[
+        (candidates['gap_pct'] <= GAP_DOWN_THRESHOLD)
     ].copy()
 
     # 5. RANDOM SELECTION
@@ -226,12 +249,12 @@ def job_entry_scan_turbo():
 
     # --- Prepare Shorts ---
     if not shorts.empty:
-        candidates = shorts.to_dict('records')
-        random.shuffle(candidates)
-        selected = candidates[:MAX_SHORTS]
+        short_list = shorts.to_dict('records')
+        random.shuffle(short_list)
+        selected = short_list[:MAX_SHORTS]
         print(f"\n🐻 SHORTS ({len(shorts)} found, picking {len(selected)}):")
         for row in selected:
-            shares = int(RISK_PER_TRADE / (row['price'] * STOP_BUFFER))
+            shares = int(POSITION_SIZE / row['price'])
             if shares > 0:
                 orders_to_send.append((row['symbol'], "SELL", shares, row['price'], row['gap_pct']))
     else:
@@ -239,12 +262,12 @@ def job_entry_scan_turbo():
 
     # --- Prepare Longs ---
     if not longs.empty:
-        candidates = longs.to_dict('records')
-        random.shuffle(candidates)
-        selected = candidates[:MAX_LONGS]
+        long_list = longs.to_dict('records')
+        random.shuffle(long_list)
+        selected = long_list[:MAX_LONGS]
         print(f"\n🐂 LONGS ({len(longs)} found, picking {len(selected)}):")
         for row in selected:
-            shares = int(RISK_PER_TRADE / (row['price'] * STOP_BUFFER))
+            shares = int(POSITION_SIZE / row['price'])
             if shares > 0:
                 orders_to_send.append((row['symbol'], "BUY", shares, row['price'], row['gap_pct']))
     else:
