@@ -359,7 +359,9 @@ def simulation_worker(dates, ticker_map, pnl_map, vol_map, type_map, seed):
         # Let's return indices to rebuild the DF accurately.
         daily_results.append(final_indices)
 
-    return np.concatenate(daily_results)
+    # Return the mapped original indices, not the positional ones
+    raw_indices = np.concatenate(daily_results)
+    return ticker_map[raw_indices]
 
 def run_simulation_optimized(master_pool):
     print(f"\n🚀 Starting Parallel Monte Carlo ({NUM_SIMULATIONS} Runs)...")
