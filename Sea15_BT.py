@@ -40,16 +40,16 @@ GAP_UP_MIN, GAP_UP_MAX = 0.05, 0.13
 GAP_DOWN_THRESHOLD = -0.05
 MIN_PRICE, MAX_PRICE = 1.00, 50.00
 LOOKBACK_DAYS = 1095        # 3 Years
-STOP_LOSS_PCT = 0.03        # 5% Stop Loss
+STOP_LOSS_PCT = 0.015        # RECOMMENDED: Bump to 1.5% to survive slippage (1.0% is too tight for humans)
 
 # SIMULATION PARAMS
 MAX_TRADES_PER_DAY = 10     
 NUM_SIMULATIONS = 50        
 FORCE_UPDATE = False        
-FORCE_REGEN_POOL = False     # Set True once to ensure Volume column exists
+FORCE_REGEN_POOL = True     # Set True once to ensure Volume column exists
 
 # FRICTION PARAMS
-SLIPPAGE_PCT = 0.001        # 0.1% per side
+SLIPPAGE_PCT = 0.002         # 0.2% per side (Total 0.4% round trip)
 COMMISSION_PER_TRADE = 1.00 
 AVG_TRADE_SIZE = 2000       
 
