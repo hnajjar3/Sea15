@@ -15,6 +15,7 @@ BENCHMARK_TICKER = 'QQQ'
 RISK_FREE_RATE = 0.03
 VAR_CONFIDENCE = 0.95
 STARTING_CAPITAL = 100000
+TEST_MODE = False
 
 # TOGGLES
 ENABLE_MC = True             # Set to True for Monte Carlo, False for Single Run
@@ -84,7 +85,11 @@ def fetch_url(url):
 def get_nasdaq_tickers():
     cache_path = os.path.join(CACHE_DIR, 'nasdaq_tickers_list.pkl')
     if not FORCE_UPDATE and os.path.exists(cache_path):
-        return pd.read_pickle(cache_path)
+        tickers = pd.read_pickle(cache_path)
+        if TEST_MODE and len(tickers) > 10:
+             print("⚠️ TEST MODE: Selecting random 10 tickers...")
+             return np.random.choice(tickers, 10, replace=False).tolist()
+        return tickers
     
     print("📡 Fetching new Ticker List from FMP...")
     endpoint = f"{BASE_URL}/stock-screener?exchange=nasdaq&limit=10000&apikey={API_KEY}"
@@ -96,6 +101,9 @@ def get_nasdaq_tickers():
                 df = df[ (df['price'] > 2.00) & (df['volume'] > 10000) ]
             tickers = df['symbol'].tolist()
             pd.to_pickle(tickers, cache_path)
+            if TEST_MODE and len(tickers) > 10:
+                 print("⚠️ TEST MODE: Selecting random 10 tickers...")
+                 return np.random.choice(tickers, 10, replace=False).tolist()
             return tickers
         return []
     except Exception:
@@ -147,7 +155,15 @@ def generate_master_pool(tickers):
             
         # Techs
         df['vol_prev'] = df['volume'].shift(1)
+
+        # Calculate Multiple SMAs for MCMC
+        df['sma_10'] = df['close'].rolling(window=10).mean().shift(1)
+        df['sma_20'] = df['close'].rolling(window=20).mean().shift(1)
+        df['sma_50'] = df['close'].rolling(window=50).mean().shift(1)
+
+        # Default SMA for Legacy Backtest
         df['sma'] = df['close'].rolling(window=SMA_PERIOD).mean().shift(1)
+
         df['prev_close'] = df['close'].shift(1)
         df['gap_pct'] = (df['open'] - df['prev_close']) / df['prev_close']
         
@@ -159,10 +175,16 @@ def generate_master_pool(tickers):
         if short_mask.any():
             shorts = df[short_mask].copy()
             for date, row in shorts.iterrows():
+                # Legacy Trend Check
                 is_aligned = True
                 if ENABLE_TREND_FILTER:
                     is_aligned = row['open'] < row['sma']
                 
+                # MCMC Trend Checks (Pre-calculated)
+                trend_10 = row['open'] < row['sma_10']
+                trend_20 = row['open'] < row['sma_20']
+                trend_50 = row['open'] < row['sma_50']
+
                 entry = row['open']
                 stop = entry * (1 + STOP_LOSS_PCT)
                 
@@ -187,7 +209,10 @@ def generate_master_pool(tickers):
                     'High': row['high'],  
                     'Low': row['low'],    
                     'Close': row['close'],
-                    'Gap_Pct': row['gap_pct']
+                    'Gap_Pct': row['gap_pct'],
+                    'Trend_10': trend_10,
+                    'Trend_20': trend_20,
+                    'Trend_50': trend_50
                 })
 
         # --- LONGS ---
@@ -195,9 +220,15 @@ def generate_master_pool(tickers):
         if long_mask.any():
             longs = df[long_mask].copy()
             for date, row in longs.iterrows():
+                # Legacy Trend Check
                 is_aligned = True
                 if ENABLE_TREND_FILTER:
                     is_aligned = row['open'] > row['sma']
+
+                # MCMC Trend Checks (Pre-calculated)
+                trend_10 = row['open'] > row['sma_10']
+                trend_20 = row['open'] > row['sma_20']
+                trend_50 = row['open'] > row['sma_50']
 
                 entry = row['open']
                 stop = entry * (1 - STOP_LOSS_PCT)
@@ -223,7 +254,10 @@ def generate_master_pool(tickers):
                     'High': row['high'], 
                     'Low': row['low'],   
                     'Close': row['close'],
-                    'Gap_Pct': row['gap_pct']
+                    'Gap_Pct': row['gap_pct'],
+                    'Trend_10': trend_10,
+                    'Trend_20': trend_20,
+                    'Trend_50': trend_50
                 })
 
     pool_df = pd.DataFrame(all_signals)
