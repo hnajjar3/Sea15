@@ -29,7 +29,7 @@ LOOKBACK_DAYS = 1095  # 3 Years
 API_KEY = 'iuRa8nmjQdLOx66QtJiSWFitzOMqu6QF' 
 BASE_URL = "https://financialmodelingprep.com/api/v3"
 CACHE_DIR = 'market_data_cache_unified'       # Shared Cache (Efficient)
-WIDE_POOL_FILE = 'sea_master_pool_WIDE.csv'   # Separate Pool File (Safe)
+WIDE_POOL_FILE = 'sea_master_pool_unified.csv'   # Separate Pool File (Safe)
 
 # FRICTION (Crucial for realistic optimization)
 SLIPPAGE_PCT = 0.001

@@ -22,14 +22,15 @@ ENABLE_MC = True             # Set to True for Monte Carlo, False for Single Run
 ENABLE_FRICTION = True       # Set to True to include Slippage & Commissions
 
 # *** TREND FILTER ***
-ENABLE_TREND_FILTER = False   # <--- Keep True for safety in liquid markets
-SMA_PERIOD = 10              # Trend definition
+ENABLE_TREND_FILTER = False   # <--- Keep True for safety in liquid markets (short only)
+SMA_PERIOD = 50              # Trend definition
 
 # *** VOLUME SOFT CAP ***
 MIN_VOLUME = 50_000          # The Floor (Hard Filter)
 MAX_VOLUME = 600_000         # <--- NEW: The Soft Ceiling (500k)
-HIGH_VOL_SAMPLE_RATE = 0.10  # <--- NEW: Only keep 10% of stocks above MAX_VOLUME
-
+HIGH_VOL_SAMPLE_RATE = 0.1  # <--- NEW: Only keep 10% of stocks above MAX_VOLUME
+# NEW: Define Liquidity Cap
+MAX_DOLLAR_VOL = 100_000_000
 # API & DATA
 API_KEY = 'iuRa8nmjQdLOx66QtJiSWFitzOMqu6QF' 
 BASE_URL = "https://financialmodelingprep.com/api/v3"
@@ -37,16 +38,17 @@ CACHE_DIR = 'market_data_cache_unified'
 MASTER_POOL_FILE = 'sea_master_pool_unified.csv'
 
 # STRATEGY PARAMS
-GAP_UP_MIN, GAP_UP_MAX = 0.05, 0.13
-GAP_DOWN_THRESHOLD = -0.05
+GAP_UP_MIN, GAP_UP_MAX = 0.03, 0.13
+GAP_DOWN_THRESHOLD = -0.03
+GAP_DOWN_FLOOR = -0.15
 MIN_PRICE, MAX_PRICE = 1.00, 50.00
 LOOKBACK_DAYS = 1095        # 3 Years
 STOP_LOSS_PCT = 0.015        # RECOMMENDED: Bump to 1.5% to survive slippage (1.0% is too tight for humans)
-
+US_STOCKS_ONLY = False      # Strictly filter to US stocks
 # SIMULATION PARAMS
 MAX_TRADES_PER_DAY = 10     
 NUM_SIMULATIONS = 50        
-FORCE_UPDATE = False        
+FORCE_UPDATE = False         # Set True to re-download all data        
 FORCE_REGEN_POOL = True     # Set True once to ensure Volume column exists
 
 # FRICTION PARAMS
@@ -82,31 +84,103 @@ def fetch_url(url):
         print(f"⚠️ Network Error: {e}")
         raise APIError(str(e))
 
-def get_nasdaq_tickers():
-    cache_path = os.path.join(CACHE_DIR, 'nasdaq_tickers_list.pkl')
+def get_etf_blacklist():
+    """
+    Fetches a list of all ETF tickers from FMP to use as a blacklist.
+    """
+    cache_path = os.path.join(CACHE_DIR, 'etf_blacklist.pkl')
     if not FORCE_UPDATE and os.path.exists(cache_path):
-        tickers = pd.read_pickle(cache_path)
-        if TEST_MODE and len(tickers) > 10:
-             print("⚠️ TEST MODE: Selecting random 10 tickers...")
-             return np.random.choice(tickers, 10, replace=False).tolist()
-        return tickers
-    
-    print("📡 Fetching new Ticker List from FMP...")
-    endpoint = f"{BASE_URL}/stock-screener?exchange=nasdaq&limit=10000&apikey={API_KEY}"
+        return pd.read_pickle(cache_path)
+
+    print("🛡️ Fetching ETF Blacklist from FMP...")
+    # This endpoint returns ALL ETFs (not just NASDAQ), which is safer
+    endpoint = f"{BASE_URL}/etf/list?apikey={API_KEY}"
     try:
         data = fetch_url(endpoint)
         if isinstance(data, list):
             df = pd.DataFrame(data)
+            etf_tickers = df['symbol'].tolist()
+            pd.to_pickle(etf_tickers, cache_path)
+            return set(etf_tickers) # Return as a set for O(1) lookups
+        return set()
+    except Exception as e:
+        print(f"⚠️ Error fetching ETF list: {e}")
+        return set()
+
+def get_nasdaq_tickers():
+    cache_path = os.path.join(CACHE_DIR, 'nasdaq_tickers_list.pkl')
+    # NOTE: FORCE_UPDATE is checked externally, but if you change filters, 
+    # you MUST set FORCE_UPDATE = True in config for one run.
+    if not FORCE_UPDATE and os.path.exists(cache_path):
+        return pd.read_pickle(cache_path)
+    
+    # 1. Get the Auto-Blacklist (All known ETFs from FMP)
+    etf_blacklist = get_etf_blacklist()
+
+    # 2. Define the "Zombie" Blacklist (Specific tickers we identified in analysis)
+    # These are crypto proxies, leveraged ETNs, or broken biotechs that slipped through.
+    manual_blacklist = [
+        # --- Leveraged ETFs & Derivatives ---
+        'UVXY', 'NVDS', 'TSDD', 'CONI', 'BTF', 'DGXX',
+        # --- Crypto Miners ---
+        #'MARA', 'RIOT', 'BITF', 'SDIG', 'BTCS',
+        # --- Crypto Proxies ---
+        #'MSTR', 'COIN', 'SMLR',
+        # --- Speculative Biotech ---
+        #'MESO', 'DBVT', 'BNTC', 'ANIX', 'SOLT',
+        # --- Micro-Cap / Illiquid ---
+        'WKSP', 'FTCI', 'DPRO', 'PXLW', 'JNVR', 'EUDA', 'RADX', 'CD'
+    ]
+    
+    print("📡 Fetching new Ticker List from FMP...")
+    # We explicitly request sector/industry/exchange to ensure we have data to filter
+    endpoint = f"{BASE_URL}/stock-screener?exchange=nasdaq&limit=10000&apikey={API_KEY}"
+    
+    try:
+        data = fetch_url(endpoint)
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+            
+            # --- FILTERING STAGE 1: IDENTIFIED TOXIC ASSETS ---
+            # Remove FMP ETFs and our Manual "Zombie" list
+            df = df[~df['symbol'].isin(etf_blacklist)]
+            df = df[~df['symbol'].isin(manual_blacklist)]
+            
+            # --- FILTERING STAGE 2: SECTOR LOCKDOWN ---
+            # This kills the "Classes" of toxic assets
+            if 'sector' in df.columns:
+                # Exclude Healthcare (Biotechs/Pharma binary risk)
+                # Exclude Financial Services (Crypto proxies, Regional Banks, SPACs)
+                toxic_sectors = ['Healthcare', 'Financial Services']
+                df = df[~df['sector'].isin(toxic_sectors)]
+            
+            # --- FILTERING STAGE 3: KEYWORD SAFETY NET ---
+            # Added: ETN, MINING, BITCOIN, THERAPEUTICS, PHARMA, ACQUISITION (SPACs)
+            toxic_keywords = [
+                'ETF', '2X', '3X', 'BULL', 'BEAR', 'INVERSE', 'SHORT', 
+                'TRUST', 'FUND', 'LP', 'SPAC', 'ETN', 'ACQUISITION',
+                'CRYPTO', 'BITCOIN', 'BLOCKCHAIN',  # <--- Kept these
+                #'THERAPEUTICS', 'PHARMA', 'SCIENCES', 'BIO' # <--- Biotechs
+                # 'MINING'  <--- REMOVED
+            ]
+            pattern = '|'.join(toxic_keywords)
+            # Filter Company Name
+            df = df[~df['companyName'].str.upper().str.contains(pattern, na=False)]
+            
+            # --- FILTERING STAGE 4: LIQUIDITY & PRICE ---
             if 'price' in df.columns and 'volume' in df.columns:
                 df = df[ (df['price'] > 2.00) & (df['volume'] > 10000) ]
+            
+            if 'country' in df.columns and US_STOCKS_ONLY:
+                df = df[df['country'] == 'US'] # Strict US-Only Rule
+
             tickers = df['symbol'].tolist()
             pd.to_pickle(tickers, cache_path)
-            if TEST_MODE and len(tickers) > 10:
-                 print("⚠️ TEST MODE: Selecting random 10 tickers...")
-                 return np.random.choice(tickers, 10, replace=False).tolist()
+            print(f"✅ Filtered Universe Size: {len(tickers)} tickers")
             return tickers
         return []
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching tickers: {e}")
         return []
 
 def get_historical_data(ticker):
@@ -131,21 +205,17 @@ def get_historical_data(ticker):
         return pd.DataFrame()
 
 # ==========================================
-# 2. MASTER POOL GENERATION
+# 2. UPDATED MASTER POOL GENERATION
 # ==========================================
-
 def generate_master_pool(tickers):
     if not FORCE_REGEN_POOL and os.path.exists(MASTER_POOL_FILE):
         print(f"📂 Loading Master Signal Pool from {MASTER_POOL_FILE}...")
-        pool = pd.read_csv(MASTER_POOL_FILE)
-        # Check if new MCMC columns exist, otherwise regenerate
-        required_cols = ['Trend_Aligned', 'Volume', 'Raw_PnL', 'High', 'Gap_Pct']
-        if all(col in pool.columns for col in required_cols):
-            return pool
-        print("⚠️ Pool missing columns (MCMC data). Regenerating...")
+        return pd.read_csv(MASTER_POOL_FILE)
 
-    print(f"⚡ Generating Signal Pool (Filter: {ENABLE_TREND_FILTER}, SMA: {SMA_PERIOD})...")
+    print(f"⚡ Generating Signal Pool (Filter: {ENABLE_TREND_FILTER})...")
     all_signals = []
+    
+
     
     for i, ticker in enumerate(tickers):
         if i % 100 == 0: print(f"   Scanning {i}/{len(tickers)}...")
@@ -155,36 +225,44 @@ def generate_master_pool(tickers):
             
         # Techs
         df['vol_prev'] = df['volume'].shift(1)
-
-        # Calculate Multiple SMAs for MCMC
+        df['dollar_vol'] = df['close'] * df['vol_prev'] # <--- Calc Dollar Volume
+        
+        # SMAs
         df['sma_10'] = df['close'].rolling(window=10).mean().shift(1)
         df['sma_20'] = df['close'].rolling(window=20).mean().shift(1)
         df['sma_50'] = df['close'].rolling(window=50).mean().shift(1)
-
-        # Default SMA for Legacy Backtest
         df['sma'] = df['close'].rolling(window=SMA_PERIOD).mean().shift(1)
 
         df['prev_close'] = df['close'].shift(1)
         df['gap_pct'] = (df['open'] - df['prev_close']) / df['prev_close']
         
-        # Filter Validity (Min Volume Only)
-        df = df[(df['open'] > MIN_PRICE) & (df['vol_prev'] > MIN_VOLUME)].copy()
+        # --- CRITICAL FILTERS APPLIED HERE ---
+        # 1. Price Checks (Min and Max)
+        # 2. Volume Check (Min)
+        # 3. Dollar Volume Check (Max - to avoid Efficient Markets)
+        df = df[
+            (df['open'] > MIN_PRICE) & 
+            (df['open'] < MAX_PRICE) &             # <--- MAX PRICE CAP
+            (df['vol_prev'] > MIN_VOLUME) & 
+            (df['dollar_vol'] < MAX_DOLLAR_VOL)    # <--- DOLLAR VOL CAP
+        ].copy()
         
         # --- SHORTS ---
         short_mask = (df['gap_pct'] >= GAP_UP_MIN) & (df['gap_pct'] <= GAP_UP_MAX)
         if short_mask.any():
             shorts = df[short_mask].copy()
             for date, row in shorts.iterrows():
-                # Legacy Trend Check
+                # Trend Logic
                 is_aligned = True
                 if ENABLE_TREND_FILTER:
                     is_aligned = row['open'] < row['sma']
                 
-                # MCMC Trend Checks (Pre-calculated)
+                # MCMC Flags
                 trend_10 = row['open'] < row['sma_10']
                 trend_20 = row['open'] < row['sma_20']
                 trend_50 = row['open'] < row['sma_50']
 
+                # Entry/Exit
                 entry = row['open']
                 stop = entry * (1 + STOP_LOSS_PCT)
                 
@@ -195,37 +273,26 @@ def generate_master_pool(tickers):
                     raw_pnl = (entry - row['close']) / entry
                     outcome = 'Win' if raw_pnl > 0 else 'Loss'
 
-                # MERGED DICTIONARY (Original + New MCMC Fields)
                 all_signals.append({
-                    'Date': date, 
-                    'Ticker': ticker, 
-                    'Type': 'Short',
-                    'Raw_PnL': raw_pnl,          # <--- Critical for Simulation
-                    'Outcome': outcome,
-                    'Trend_Aligned': is_aligned,
-                    'Entry_Price': entry,
-                    'Volume': row['vol_prev'],
-                    # NEW FIELDS FOR MCMC:
-                    'High': row['high'],  
-                    'Low': row['low'],    
-                    'Close': row['close'],
+                    'Date': date, 'Ticker': ticker, 'Type': 'Short',
+                    'Raw_PnL': raw_pnl, 'Outcome': outcome,
+                    'Trend_Aligned': is_aligned, 'Entry_Price': entry,
+                    'Volume': row['vol_prev'], 'High': row['high'],
+                    'Low': row['low'], 'Close': row['close'],
                     'Gap_Pct': row['gap_pct'],
-                    'Trend_10': trend_10,
-                    'Trend_20': trend_20,
-                    'Trend_50': trend_50
+                    'Trend_10': trend_10, 'Trend_20': trend_20, 'Trend_50': trend_50
                 })
 
         # --- LONGS ---
-        long_mask = (df['gap_pct'] <= GAP_DOWN_THRESHOLD)
+        # Apply the Floor to avoid falling knives
+        long_mask = (df['gap_pct'] <= GAP_DOWN_THRESHOLD) & (df['gap_pct'] >= GAP_DOWN_FLOOR)
         if long_mask.any():
             longs = df[long_mask].copy()
             for date, row in longs.iterrows():
-                # Legacy Trend Check
                 is_aligned = True
-                if ENABLE_TREND_FILTER:
-                    is_aligned = row['open'] > row['sma']
+                #if ENABLE_TREND_FILTER:
+                #    is_aligned = row['open'] > row['sma']
 
-                # MCMC Trend Checks (Pre-calculated)
                 trend_10 = row['open'] > row['sma_10']
                 trend_20 = row['open'] > row['sma_20']
                 trend_50 = row['open'] > row['sma_50']
@@ -240,24 +307,14 @@ def generate_master_pool(tickers):
                     raw_pnl = (row['close'] - entry) / entry
                     outcome = 'Win' if raw_pnl > 0 else 'Loss'
 
-                # MERGED DICTIONARY (Original + New MCMC Fields)
                 all_signals.append({
-                    'Date': date, 
-                    'Ticker': ticker, 
-                    'Type': 'Long',
-                    'Raw_PnL': raw_pnl,          # <--- Critical for Simulation
-                    'Outcome': outcome,
-                    'Trend_Aligned': is_aligned,
-                    'Entry_Price': entry,
-                    'Volume': row['vol_prev'],
-                    # NEW FIELDS FOR MCMC:
-                    'High': row['high'], 
-                    'Low': row['low'],   
-                    'Close': row['close'],
+                    'Date': date, 'Ticker': ticker, 'Type': 'Long',
+                    'Raw_PnL': raw_pnl, 'Outcome': outcome,
+                    'Trend_Aligned': is_aligned, 'Entry_Price': entry,
+                    'Volume': row['vol_prev'], 'High': row['high'],
+                    'Low': row['low'], 'Close': row['close'],
                     'Gap_Pct': row['gap_pct'],
-                    'Trend_10': trend_10,
-                    'Trend_20': trend_20,
-                    'Trend_50': trend_50
+                    'Trend_10': trend_10, 'Trend_20': trend_20, 'Trend_50': trend_50
                 })
 
     pool_df = pd.DataFrame(all_signals)
