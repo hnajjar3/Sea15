@@ -428,6 +428,27 @@ def calculate_financial_metrics(sim_df, bench_ret):
     """
     Calculates the full 13-metric financial suite for a single simulation run.
     """
+    # Handle Empty Simulation
+    if sim_df.empty:
+        # Create a flat equity curve using benchmark dates if available
+        if not bench_ret.empty:
+            dates = bench_ret.index
+        else:
+            dates = [datetime.now()]
+
+        equity_series = pd.Series(STARTING_CAPITAL, index=dates)
+
+        return {
+            'CAGR': 0.0, 'Vol (Ann)': 0.0, 'Sharpe': 0.0, 'Sortino': 0.0,
+            'Max DD %': 0.0, 'Recovery Factor': 0.0, 'Beta': 0.0,
+            'Alpha (Ann)': 0.0, 'Treynor': 0.0, 'Info Ratio': 0.0,
+            'Calmar': 0.0, 'Omega': 0.0, 'VaR 95%': 0.0, 'CVaR 95%': 0.0,
+            'Win Rate %': 0.0, 'Stop-out %': 0.0, 'Profit Factor': 0.0,
+            'Avg Win %': 0.0, 'Avg Loss %': 0.0, 'Payoff Ratio': 0.0,
+            'Expectancy %': 0.0, 'Max Consec Wins': 0, 'Max Consec Losses': 0,
+            'Trades': 0, 'Equity Curve': equity_series
+        }
+
     # 1. Prepare Daily Equity Curve
     sim_df = sim_df.copy()
     
@@ -523,14 +544,65 @@ def calculate_financial_metrics(sim_df, bench_ret):
 
     # Basic Trade Stats
     wins = sim_df[sim_df['Net_PnL'] > 0]
-    win_rate = (len(wins) / len(sim_df))
+    losses = sim_df[sim_df['Net_PnL'] <= 0]
+
+    win_rate = (len(wins) / len(sim_df)) if len(sim_df) > 0 else 0
+
+    # NEW METRICS
+    # 1. Stop-out %
+    if 'Outcome' in sim_df.columns:
+        stop_outs = sim_df[sim_df['Outcome'] == 'Stopped Out']
+        stop_out_pct = len(stop_outs) / len(sim_df) if len(sim_df) > 0 else 0
+    else:
+        stop_out_pct = 0.0
+
+    # 2. Profit Factor
+    gross_win = wins['Net_PnL'].sum()
+    gross_loss = abs(losses['Net_PnL'].sum())
+    profit_factor = gross_win / gross_loss if gross_loss > 0 else float('inf')
+
+    # 3. Avg Win / Avg Loss
+    avg_win = wins['Net_PnL'].mean() if not wins.empty else 0
+    avg_loss = losses['Net_PnL'].mean() if not losses.empty else 0
+
+    # 4. Payoff Ratio
+    payoff_ratio = avg_win / abs(avg_loss) if abs(avg_loss) > 0 else 0
+
+    # 5. Expectancy
+    loss_rate = 1.0 - win_rate
+    expectancy = (win_rate * avg_win) + (loss_rate * avg_loss)
+
+    # 6. Max Consecutive Wins/Losses
+    is_win = sim_df['Net_PnL'] > 0
+    # Group consecutive trues/falses
+    # We create a series of group ids that change when is_win changes
+    if not is_win.empty:
+        groups = (is_win != is_win.shift()).cumsum()
+        consec_counts = is_win.groupby(groups).count()
+        consec_types = is_win.groupby(groups).first()
+
+        max_consec_wins = consec_counts[consec_types == True].max() if (consec_types == True).any() else 0
+        max_consec_losses = consec_counts[consec_types == False].max() if (consec_types == False).any() else 0
+    else:
+        max_consec_wins = 0
+        max_consec_losses = 0
+
+    # 7. Recovery Factor
+    total_net_profit = sim_df['Net_PnL'].sum() * AVG_TRADE_SIZE
+    # Max Drawdown in Dollars
+    roll_max_dollar = equity_df['Equity'].cummax()
+    dd_dollar = roll_max_dollar - equity_df['Equity']
+    max_dd_val = dd_dollar.max()
     
+    recovery_factor = total_net_profit / max_dd_val if max_dd_val > 0 else (float('inf') if total_net_profit > 0 else 0)
+
     return {
         'CAGR': cagr,
         'Vol (Ann)': vol,
         'Sharpe': sharpe,
         'Sortino': sortino,
         'Max DD %': max_dd,
+        'Recovery Factor': recovery_factor,
         'Beta': beta,
         'Alpha (Ann)': alpha,
         'Treynor': treynor,
@@ -540,9 +612,32 @@ def calculate_financial_metrics(sim_df, bench_ret):
         'VaR 95%': var_95,
         'CVaR 95%': cvar_95,
         'Win Rate %': win_rate,
+        'Stop-out %': stop_out_pct,
+        'Profit Factor': profit_factor,
+        'Avg Win %': avg_win,
+        'Avg Loss %': avg_loss,
+        'Payoff Ratio': payoff_ratio,
+        'Expectancy %': expectancy,
+        'Max Consec Wins': max_consec_wins,
+        'Max Consec Losses': max_consec_losses,
         'Trades': len(sim_df),
         'Equity Curve': equity_df['Equity'] # For Charting
     }
+
+def plot_mc_curves(ax, curves_df, title, stats_df):
+    for col in curves_df.columns:
+        ax.plot(curves_df.index, curves_df[col], alpha=0.1, color='gray', linewidth=1)
+
+    if not curves_df.empty:
+        avg_curve = curves_df.mean(axis=1)
+        ax.plot(avg_curve.index, avg_curve, color='#007BFF', linewidth=2.5, label='Average')
+
+    sharpe_mean = stats_df['Sharpe'].mean()
+    cagr_mean = stats_df['CAGR'].mean() * 100
+
+    ax.set_title(f"{title} | Sharpe: {sharpe_mean:.2f} | CAGR: {cagr_mean:.1f}%")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper left')
 
 def generate_report(simulations, benchmark_ret):
     if not simulations: return
@@ -550,53 +645,90 @@ def generate_report(simulations, benchmark_ret):
     
     if ENABLE_MC:
         print(f"\n📊 MONTE CARLO REPORT ({NUM_SIMULATIONS} Runs)")
-        all_stats = []
-        equity_curves = []
+
+        # Containers
+        stats_total, stats_long, stats_short = [], [], []
+        curves_total, curves_long, curves_short = [], [], []
         
         for sim in simulations:
-            metrics = calculate_financial_metrics(sim, benchmark_ret)
+            sim_id = sim['Sim_ID'].iloc[0] if not sim.empty else "Unknown"
+
+            # TOTAL
+            m_total = calculate_financial_metrics(sim, benchmark_ret)
+            c_total = m_total.pop('Equity Curve')
+            c_total.name = f"Run_{sim_id}"
+            stats_total.append(m_total)
+            curves_total.append(c_total)
+
+            # LONG
+            sim_long = sim[sim['Type'] == 'Long']
+            m_long = calculate_financial_metrics(sim_long, benchmark_ret)
+            c_long = m_long.pop('Equity Curve')
+            c_long.name = f"Run_{sim_id}"
+            stats_long.append(m_long)
+            curves_long.append(c_long)
+
+            # SHORT
+            sim_short = sim[sim['Type'] == 'Short']
+            m_short = calculate_financial_metrics(sim_short, benchmark_ret)
+            c_short = m_short.pop('Equity Curve')
+            c_short.name = f"Run_{sim_id}"
+            stats_short.append(m_short)
+            curves_short.append(c_short)
+
+        # Helper to print and save
+        def process_stats(stats_list, label):
+            kpi_df = pd.DataFrame(stats_list)
             
-            # Separate the curve from the stats dict
-            curve = metrics.pop('Equity Curve')
-            curve.name = f"Run_{sim['Sim_ID'].iloc[0]}"
-            equity_curves.append(curve)
+            print(f"\n--- {label.upper()} STRATEGY ---")
+            print("="*100)
+            print(f"{'Metric':<20} | {'Mean':<12} | {'Min (Worst)':<12} | {'Max (Best)':<12}")
+            print("-" * 100)
             
-            all_stats.append(metrics)
+            pct_metrics = ['CAGR', 'Vol (Ann)', 'Max DD %', 'Win Rate %', 'VaR 95%', 'CVaR 95%', 'Alpha (Ann)', 'Stop-out %', 'Avg Win %', 'Avg Loss %', 'Expectancy %']
             
-        kpi_df = pd.DataFrame(all_stats)
-        
-        # Format and Print
-        print("="*100)
-        print(f"{'Metric':<20} | {'Mean':<12} | {'Min (Worst)':<12} | {'Max (Best)':<12}")
-        print("-" * 100)
-        
-        pct_metrics = ['CAGR', 'Vol (Ann)', 'Max DD %', 'Win Rate %', 'VaR 95%', 'CVaR 95%', 'Alpha (Ann)']
-        
-        for col in kpi_df.columns:
-            mean_val = kpi_df[col].mean()
-            min_val = kpi_df[col].min()
-            max_val = kpi_df[col].max()
-            
-            if col in pct_metrics:
-                print(f"{col:<20} | {mean_val*100:11.2f}% | {min_val*100:11.2f}% | {max_val*100:11.2f}%")
-            else:
-                print(f"{col:<20} | {mean_val:12.2f} | {min_val:12.2f} | {max_val:12.2f}")
-                
-        print("="*100)
-        kpi_df.to_csv(f"summary_mc_{timestamp}.csv", index=False)
-        
+            for col in kpi_df.columns:
+                mean_val = kpi_df[col].mean()
+                min_val = kpi_df[col].min()
+                max_val = kpi_df[col].max()
+
+                if col in pct_metrics:
+                    print(f"{col:<20} | {mean_val*100:11.2f}% | {min_val*100:11.2f}% | {max_val*100:11.2f}%")
+                else:
+                    print(f"{col:<20} | {mean_val:12.2f} | {min_val:12.2f} | {max_val:12.2f}")
+            print("="*100)
+
+            kpi_df.to_csv(f"summary_mc_{label}_{timestamp}.csv", index=False)
+            return kpi_df
+
+        df_total = process_stats(stats_total, "total")
+        df_long = process_stats(stats_long, "long")
+        df_short = process_stats(stats_short, "short")
+
         # Charting
-        full_curves = pd.concat(equity_curves, axis=1).ffill().fillna(STARTING_CAPITAL)
-        plt.figure(figsize=(12, 8))
-        for col in full_curves.columns:
-            plt.plot(full_curves.index, full_curves[col], alpha=0.1, color='gray', linewidth=1)
-        avg_curve = full_curves.mean(axis=1)
-        plt.plot(avg_curve.index, avg_curve, color='#007BFF', linewidth=2.5, label='Average Outcome')
-        plt.title(f"Monte Carlo ({NUM_SIMULATIONS} Runs) | Sharpe: {kpi_df['Sharpe'].mean():.2f} | CAGR: {kpi_df['CAGR'].mean()*100:.1f}%")
-        plt.xlabel("Date"); plt.ylabel("Equity ($)")
-        plt.legend(); plt.grid(True, alpha=0.3)
-        plt.savefig(f"chart_mc_{timestamp}.png")
-        print(f"✅ Chart saved.")
+        full_total = pd.concat(curves_total, axis=1).ffill().fillna(STARTING_CAPITAL)
+        full_long = pd.concat(curves_long, axis=1).ffill().fillna(STARTING_CAPITAL)
+        full_short = pd.concat(curves_short, axis=1).ffill().fillna(STARTING_CAPITAL)
+        
+        fig = plt.figure(figsize=(15, 10))
+        
+        # Top: Total
+        ax1 = plt.subplot(2, 1, 1)
+        plot_mc_curves(ax1, full_total, "Total Strategy", df_total)
+        ax1.set_ylabel("Equity ($)")
+        
+        # Bottom Left: Short
+        ax2 = plt.subplot(2, 2, 3)
+        plot_mc_curves(ax2, full_short, "Short Only", df_short)
+        ax2.set_ylabel("Equity ($)")
+        
+        # Bottom Right: Long
+        ax3 = plt.subplot(2, 2, 4)
+        plot_mc_curves(ax3, full_long, "Long Only", df_long)
+
+        plt.tight_layout()
+        plt.savefig(f"chart_mc_split_{timestamp}.png")
+        print(f"✅ Split Chart saved.")
 
 def get_benchmark_data():
     print(f"📡 Fetching Benchmark ({BENCHMARK_TICKER}) Data...")
@@ -644,22 +776,36 @@ def generate_excel_report_full(simulations, benchmark_data):
     
     print(f"\n📝 Generating Excel Report...")
     
-    # 1. Generate Daily Log
+    # 1. Generate Daily Log (for the Total strategy)
     daily_df = process_portfolio_daily(best_sim, benchmark_data)
     
-    # 2. Generate Full Financial Metrics (Re-using the robust function)
-    metrics_dict = calculate_financial_metrics(best_sim, benchmark_data)
+    # 2. Generate Full Financial Metrics for splits
+    # Unified
+    m_total = calculate_financial_metrics(best_sim, benchmark_data)
+    if 'Equity Curve' in m_total: del m_total['Equity Curve']
+
+    # Long
+    sim_long = best_sim[best_sim['Type'] == 'Long']
+    m_long = calculate_financial_metrics(sim_long, benchmark_data)
+    if 'Equity Curve' in m_long: del m_long['Equity Curve']
+
+    # Short
+    sim_short = best_sim[best_sim['Type'] == 'Short']
+    m_short = calculate_financial_metrics(sim_short, benchmark_data)
+    if 'Equity Curve' in m_short: del m_short['Equity Curve']
+
+    # Combine
+    summary_df = pd.DataFrame({
+        'Unified': pd.Series(m_total),
+        'Long': pd.Series(m_long),
+        'Short': pd.Series(m_short)
+    })
     
-    # Remove the large Series object so it doesn't clutter the Summary sheet
-    if 'Equity Curve' in metrics_dict:
-        del metrics_dict['Equity Curve']
-        
     filename = f"Sea15_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     try:
         with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            # Summary Sheet with ALL 13 KPIs
-            summary_series = pd.Series(metrics_dict, name="Value")
-            summary_series.to_excel(writer, sheet_name="Summary")
+            # Summary Sheet with Split Columns
+            summary_df.to_excel(writer, sheet_name="Summary")
             
             # Daily Log Sheet
             if not daily_df.empty: daily_df.to_excel(writer, sheet_name="Daily_Log")
