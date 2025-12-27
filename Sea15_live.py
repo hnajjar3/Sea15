@@ -55,7 +55,7 @@ MIN_PRICE = 1.00
 MAX_PRICE = 50.00      
 MIN_VOLUME = 50000            # Increased to 50k
 MAX_VOLUME = 600000           # Soft Cap Ceiling
-MAX_DOLLAR_VOL = 100_000_000  # <--- NEW: Liquidity Cap
+MAX_DOLLAR_VOL = 500_000_000  # <--- NEW: Liquidity Cap
 HIGH_VOL_SAMPLE_RATE = 0.10   # Keep 10% of stocks > MAX_VOLUME
 
 # ------------------------------------------------------------------------------
@@ -150,7 +150,7 @@ def get_clean_universe():
 
             # --- FILTERING STAGE 2: SECTOR LOCKDOWN ---
             if 'sector' in df.columns:
-                toxic_sectors = ['Healthcare', 'Financial Services']
+                toxic_sectors = ['Bogus']
                 df = df[~df['sector'].isin(toxic_sectors)]
 
             # --- FILTERING STAGE 3: KEYWORD SAFETY NET ---
