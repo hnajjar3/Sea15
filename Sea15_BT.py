@@ -26,9 +26,9 @@ ENABLE_TREND_FILTER = False   # <--- Keep True for safety in liquid markets (sho
 SMA_PERIOD = 50              # Trend definition
 
 # *** VOLUME SOFT CAP ***
-MIN_VOLUME = 50_000          # The Floor (Hard Filter)
+MIN_VOLUME = 60_000          # The Floor (Hard Filter)
 MAX_VOLUME = 600_000         # <--- NEW: The Soft Ceiling (500k)
-HIGH_VOL_SAMPLE_RATE = 0.1  # <--- NEW: Only keep 10% of stocks above MAX_VOLUME
+HIGH_VOL_SAMPLE_RATE = 0.01  # <--- NEW: Only keep 1% of stocks above MAX_VOLUME
 # NEW: Define Liquidity Cap
 MAX_DOLLAR_VOL = 500_000_000
 # API & DATA
@@ -48,7 +48,7 @@ US_STOCKS_ONLY = False      # Strictly filter to US stocks
 # SIMULATION PARAMS
 MAX_TRADES_PER_DAY = 10     
 NUM_SIMULATIONS = 50        
-FORCE_UPDATE = True         # Set True to re-download all data        
+FORCE_UPDATE = False         # Set True to re-download all data        
 FORCE_REGEN_POOL = True     # Set True once to ensure Volume column exists
 
 # FRICTION PARAMS
