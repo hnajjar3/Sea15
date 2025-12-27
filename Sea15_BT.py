@@ -30,7 +30,7 @@ MIN_VOLUME = 50_000          # The Floor (Hard Filter)
 MAX_VOLUME = 600_000         # <--- NEW: The Soft Ceiling (500k)
 HIGH_VOL_SAMPLE_RATE = 0.1  # <--- NEW: Only keep 10% of stocks above MAX_VOLUME
 # NEW: Define Liquidity Cap
-MAX_DOLLAR_VOL = 100_000_000
+MAX_DOLLAR_VOL = 500_000_000
 # API & DATA
 API_KEY = 'iuRa8nmjQdLOx66QtJiSWFitzOMqu6QF' 
 BASE_URL = "https://financialmodelingprep.com/api/v3"
@@ -48,7 +48,7 @@ US_STOCKS_ONLY = False      # Strictly filter to US stocks
 # SIMULATION PARAMS
 MAX_TRADES_PER_DAY = 10     
 NUM_SIMULATIONS = 50        
-FORCE_UPDATE = False         # Set True to re-download all data        
+FORCE_UPDATE = True         # Set True to re-download all data        
 FORCE_REGEN_POOL = True     # Set True once to ensure Volume column exists
 
 # FRICTION PARAMS
@@ -151,7 +151,7 @@ def get_nasdaq_tickers():
             if 'sector' in df.columns:
                 # Exclude Healthcare (Biotechs/Pharma binary risk)
                 # Exclude Financial Services (Crypto proxies, Regional Banks, SPACs)
-                toxic_sectors = ['Healthcare', 'Financial Services']
+                toxic_sectors = ['Bogus']  # insert sectors to always exclude here
                 df = df[~df['sector'].isin(toxic_sectors)]
             
             # --- FILTERING STAGE 3: KEYWORD SAFETY NET ---
