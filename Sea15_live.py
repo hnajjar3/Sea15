@@ -28,10 +28,11 @@ ALPACA_SECRET = "AS4aE8iuwj4nB1YUoMCHamSfBcodV6sX3i5cCdYLuS3M"
 # SYSTEM SETTINGS
 LOG_FILE = "sea15_live_log.csv"
 REPORT_DIR = "weekly_reports"
+CACHE_DIR = "live_cache"
 MAX_WORKERS = 20  # Number of parallel threads for fetching/trading
 
 # SCHEDULE (PACIFIC TIME)
-PREP_TIME  = "06:00"   # Pre-load tickers 30 mins before open
+PREP_TIME  = "03:00"   # Pre-load tickers well before open
 ENTRY_TIME = "06:30"   # Trigger logic starts at Open
 EXIT_TIME  = "12:55"   
 REPORT_TIME = "09:00"  # Saturday
@@ -46,13 +47,15 @@ MAX_SHORTS = 5
 MAX_LONGS = 5          
 
 # STRATEGY PARAMETERS
-GAP_UP_MIN = 0.05              
-GAP_UP_MAX = 0.13      
-GAP_DOWN_THRESHOLD = -0.05     
+GAP_UP_MIN = 0.03
+GAP_UP_MAX = 0.13
+GAP_DOWN_THRESHOLD = -0.03
+GAP_DOWN_FLOOR = -0.15          # <--- NEW: Floor to avoid falling knives
 MIN_PRICE = 1.00       
 MAX_PRICE = 50.00      
 MIN_VOLUME = 50000            # Increased to 50k
 MAX_VOLUME = 600000           # Soft Cap Ceiling
+MAX_DOLLAR_VOL = 100_000_000  # <--- NEW: Liquidity Cap
 HIGH_VOL_SAMPLE_RATE = 0.10   # Keep 10% of stocks > MAX_VOLUME
 
 # ------------------------------------------------------------------------------
@@ -69,9 +72,120 @@ FILE_LOCK = threading.Lock()
 if not os.path.exists(REPORT_DIR):
     os.makedirs(REPORT_DIR)
 
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+
 # ------------------------------------------------------------------------------
-# 3. HIGH-SPEED NETWORK FUNCTIONS
+# 3. HIGH-SPEED NETWORK FUNCTIONS & FILTERS
 # ------------------------------------------------------------------------------
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=16)
+)
+def fetch_url(url):
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        return []
+    except Exception as e:
+        print(f"⚠️ Network Error: {e}")
+        return []
+
+def get_etf_blacklist():
+    """
+    Fetches a list of all ETF tickers from FMP to use as a blacklist.
+    """
+    cache_path = os.path.join(CACHE_DIR, 'etf_blacklist.pkl')
+    # Check if cached today
+    if os.path.exists(cache_path):
+        # Optional: Check file age to force refresh daily
+        file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+        if file_time.date() == datetime.now().date():
+            return pd.read_pickle(cache_path)
+
+    print("🛡️ Fetching ETF Blacklist from FMP...")
+    endpoint = f"{BASE_URL}/etf/list?apikey={FMP_API_KEY}"
+    try:
+        data = fetch_url(endpoint)
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+            etf_tickers = df['symbol'].tolist()
+            pd.to_pickle(set(etf_tickers), cache_path)
+            return set(etf_tickers)
+        return set()
+    except Exception as e:
+        print(f"⚠️ Error fetching ETF list: {e}")
+        return set()
+
+def get_clean_universe():
+    """
+    Runs the full filtering logic (Blacklist, Sector, Dollar Volume).
+    """
+    # 1. Get the Auto-Blacklist (All known ETFs from FMP)
+    etf_blacklist = get_etf_blacklist()
+
+    # 2. Define the "Zombie" Blacklist
+    manual_blacklist = [
+        # --- Leveraged ETFs & Derivatives ---
+        'UVXY', 'NVDS', 'TSDD', 'CONI', 'BTF', 'DGXX',
+        # --- Micro-Cap / Illiquid ---
+        'WKSP', 'FTCI', 'DPRO', 'PXLW', 'JNVR', 'EUDA', 'RADX', 'CD'
+    ]
+
+    print("📡 Fetching new Ticker List from FMP...")
+    # Request sector/industry/exchange to filter
+    # Note: We filter strictly by NASDAQ exchange in the query
+    endpoint = f"{BASE_URL}/stock-screener?exchange=nasdaq&limit=10000&apikey={FMP_API_KEY}"
+
+    try:
+        data = fetch_url(endpoint)
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+
+            # --- FILTERING STAGE 1: IDENTIFIED TOXIC ASSETS ---
+            # Remove FMP ETFs and our Manual "Zombie" list
+            df = df[~df['symbol'].isin(etf_blacklist)]
+            df = df[~df['symbol'].isin(manual_blacklist)]
+
+            # --- FILTERING STAGE 2: SECTOR LOCKDOWN ---
+            if 'sector' in df.columns:
+                toxic_sectors = ['Healthcare', 'Financial Services']
+                df = df[~df['sector'].isin(toxic_sectors)]
+
+            # --- FILTERING STAGE 3: KEYWORD SAFETY NET ---
+            toxic_keywords = [
+                'ETF', '2X', '3X', 'BULL', 'BEAR', 'INVERSE', 'SHORT',
+                'TRUST', 'FUND', 'LP', 'SPAC', 'ETN', 'ACQUISITION',
+                'CRYPTO', 'BITCOIN', 'BLOCKCHAIN'
+            ]
+            pattern = '|'.join(toxic_keywords)
+            # Filter Company Name
+            df = df[~df['companyName'].str.upper().str.contains(pattern, na=False)]
+
+            # --- FILTERING STAGE 4: LIQUIDITY & PRICE ---
+            # Also calculate Dollar Volume (Price * Volume)
+            # FMP Screener usually returns last close data
+            if 'price' in df.columns and 'volume' in df.columns:
+                df['dollar_vol'] = df['price'] * df['volume']
+
+                df = df[
+                    (df['price'] > 2.00) &
+                    (df['volume'] > 10000) &
+                    (df['dollar_vol'] < MAX_DOLLAR_VOL) # <--- NEW CAP
+                ]
+
+            # Country Check (Default FMP screener might include others, but we usually want US)
+            # BT has US_STOCKS_ONLY = False, so we SKIP country check to match BT.
+
+            tickers = df['symbol'].tolist()
+            print(f"✅ Filtered Universe Size: {len(tickers)} tickers")
+            return tickers
+        return []
+    except Exception as e:
+        print(f"Error fetching tickers: {e}")
+        return []
+
 def fetch_batch_quotes(tickers):
     """Worker function to fetch a single batch of quotes."""
     if not tickers: return []
@@ -164,22 +278,27 @@ def log_entry(ticker, type_, price, gap, shares):
 # 5. CORE LOGIC JOBS
 # ------------------------------------------------------------------------------
 def job_update_universe():
-    """Runs Pre-Market to load the gun."""
+    """Runs Pre-Market to load the gun using Robust Filters."""
     global TICKER_UNIVERSE
     print("\n" + "="*60)
     print(f"📡 PRE-MARKET PREP | {datetime.now().strftime('%H:%M:%S')}")
     print("="*60)
     
-    url = f"{BASE_URL}/stock-screener?exchange=nasdaq&limit=6000&volumeMoreThan={MIN_VOLUME}&priceMoreThan={MIN_PRICE}&apikey={FMP_API_KEY}"
-    try:
-        data = requests.get(url).json()
-        if isinstance(data, list):
-            TICKER_UNIVERSE = [x['symbol'] for x in data]
-            print(f"✅ UNIVERSE UPDATED: {len(TICKER_UNIVERSE)} tickers ready in memory.")
-        else:
-            print("❌ FAILED to download ticker list.")
-    except Exception as e:
-        print(f"❌ ERROR: {e}")
+    cache_path = os.path.join(CACHE_DIR, 'universe_cache.pkl')
+
+    # Try to load cache if we are just restarting the script mid-day
+    # But usually we want to run this fresh at 3AM
+
+    clean_tickers = get_clean_universe()
+    if clean_tickers:
+        TICKER_UNIVERSE = clean_tickers
+        pd.to_pickle(TICKER_UNIVERSE, cache_path)
+        print(f"✅ UNIVERSE UPDATED: {len(TICKER_UNIVERSE)} tickers ready in memory.")
+    else:
+        print("❌ FAILED to update universe. Trying to load old cache...")
+        if os.path.exists(cache_path):
+            TICKER_UNIVERSE = pd.read_pickle(cache_path)
+            print(f"⚠️ LOADED CACHED UNIVERSE: {len(TICKER_UNIVERSE)} tickers.")
 
 def job_entry_scan_turbo():
     global TICKER_UNIVERSE
@@ -241,7 +360,8 @@ def job_entry_scan_turbo():
     ].copy()
 
     longs = candidates[
-        (candidates['gap_pct'] <= GAP_DOWN_THRESHOLD)
+        (candidates['gap_pct'] <= GAP_DOWN_THRESHOLD) &
+        (candidates['gap_pct'] >= GAP_DOWN_FLOOR)  # <--- NEW: Floor logic applied
     ].copy()
 
     # 5. RANDOM SELECTION
